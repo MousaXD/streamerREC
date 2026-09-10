@@ -1149,7 +1149,13 @@ async def run_recording(rec_id: str):
         # can be decoded safely. Remux to the requested container afterward.
         fp = rec.get("filepath", "")
         target_fmt = fmt.lower() if fmt.lower() in ("mp4", "mkv", "ts") else "ts"
-        if platform == "bigo" and fp and Path(fp).exists() and target_fmt != "ts":
+        if (
+            platform == "bigo"
+            and rec.get("status") == "completed"
+            and fp
+            and Path(fp).exists()
+            and target_fmt != "ts"
+        ):
             target_path = str(Path(fp).with_suffix(f".{target_fmt}"))
             try:
                 async with _proc_semaphore:
@@ -1272,7 +1278,11 @@ async def run_recording(rec_id: str):
         retry_ch_id = rec.get("channel_id")
         # Don't retry if stream ran for more than 30s — that's a natural end, not a crash
         run_duration = (rec.get("ended_at") or time.time()) - (rec.get("started_at") or time.time())
-        natural_end  = run_duration > 30 and file_captured
+        natural_end  = (
+            run_duration > 30
+            and file_captured
+            and not (platform == "bigo" and rec.get("status") == "error")
+        )
         should_retry = (
             not rec.get("stopping")
             and not natural_end
