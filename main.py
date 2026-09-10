@@ -558,7 +558,7 @@ async def fetch_metadata(url: str, proxy: str = "") -> dict:
                 "is_live": bool(info.get("alive") and info.get("hls_src")),
                 "stream_title": (info.get("stream_title") or "").strip(),
             }
-        except BigoError as e:
+        except Exception as e:
             logger.debug("BIGO metadata lookup failed for %s: %s", url, e)
             if url_username:
                 return {
@@ -698,7 +698,7 @@ async def check_is_live(url: str, proxy: str = "") -> bool:
         try:
             info = await fetch_bigo_info(url, proxy=proxy)
             return bool(info.get("alive") and info.get("hls_src"))
-        except BigoError as e:
+        except Exception as e:
             logger.debug("BIGO live check failed for %s: %s", url, e)
             return False
 
@@ -1115,7 +1115,7 @@ async def run_recording(rec_id: str):
             size_task.cancel()
         if duration_task:
             duration_task.cancel()
-        # Make sure we never leave an orphaned yt-dlp subprocess running
+        # Make sure we never leave an orphaned recorder subprocess running
         if proc is not None and proc.returncode is None:
             try:
                 _kill_proc(proc.pid, force=False)
@@ -1132,7 +1132,7 @@ async def run_recording(rec_id: str):
         rec["ended_at"] = time.time()
         rec.pop("pid", None)
 
-        # Fall back to file glob if yt-dlp didn't print the path
+        # Fall back to file glob if the recorder didn't report the path
         if not rec.get("filepath"):
             for f in rec_dir.glob(f"{stem}.*"):
                 rec["filepath"] = str(f)
@@ -1186,7 +1186,7 @@ async def run_recording(rec_id: str):
         # smooth playback (faststart).  Run on ALL completed recordings —
         # not just manual stops — so files play without lag on any device.
         fp = rec.get("filepath", "")
-        if fp and Path(fp).exists():
+        if platform != "bigo" and fp and Path(fp).exists():
             suffix    = Path(fp).suffix
             fixed_path = str(Path(fp).with_name(Path(fp).stem + "_fixed" + suffix))
             try:
