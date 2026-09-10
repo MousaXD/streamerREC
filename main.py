@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from bigo import BigoError, fetch_bigo_info, is_bigo_url
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -127,11 +128,19 @@ app = FastAPI(title="StreamRec API", version=VERSION, lifespan=lifespan)
 
 
 def _sweep_orphan_recorders() -> int:
-    """Kill yt-dlp/ffmpeg leftovers from a previous crashed/stopped instance.
-    On startup no legit recording children exist yet, so any recorder process
-    whose command line references our recordings dir is an orphan."""
+    """Kill recorder leftovers from a previous crashed/stopped instance.
+    On startup no legit recording children exist yet, so any known recorder
+    process whose command line references our recordings dir is an orphan."""
     killed = 0
     rec_str = str(RECORDINGS_DIR)
+
+    def _is_recorder_process(name: str, cmdline: str) -> bool:
+        lname = (name or "").lower()
+        return (
+            lname in ("yt-dlp.exe", "yt-dlp", "ffmpeg", "ffmpeg.exe")
+            or (lname.startswith("python") and "bigo_recorder.py" in cmdline)
+        )
+
     try:
         import psutil  # optional dependency
     except ImportError:
@@ -139,30 +148,30 @@ def _sweep_orphan_recorders() -> int:
     if psutil is not None:
         for p in psutil.process_iter(["name", "cmdline"]):
             try:
-                name = (p.info["name"] or "").lower()
-                if name not in ("yt-dlp.exe", "yt-dlp", "ffmpeg", "ffmpeg.exe"):
-                    continue
+                name = p.info["name"] or ""
                 cmdline = " ".join(p.info["cmdline"] or [])
+                if not _is_recorder_process(name, cmdline):
+                    continue
                 if rec_str in cmdline:
                     p.kill()
                     killed += 1
             except Exception:
                 continue
     elif IS_WINDOWS:
-        # Fallback: CIM query (startup-only, so the cost is fine)
         try:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "Get-CimInstance Win32_Process | "
-                 "Where-Object { $_.Name -match '^(yt-dlp|ffmpeg)' } | "
-                 "Select-Object ProcessId, CommandLine | ConvertTo-Json"],
+                 "Where-Object { $_.Name -match '^(yt-dlp|ffmpeg|python)' } | "
+                 "Select-Object Name, ProcessId, CommandLine | ConvertTo-Json"],
                 capture_output=True, text=True, timeout=20,
             )
             data = json.loads(out.stdout or "[]")
             if isinstance(data, dict):
                 data = [data]
             for entry in data or []:
-                if rec_str in (entry.get("CommandLine") or ""):
+                cmdline = entry.get("CommandLine") or ""
+                if rec_str in cmdline and _is_recorder_process(entry.get("Name") or "", cmdline):
                     subprocess.run(["taskkill", "/F", "/PID", str(entry["ProcessId"])],
                                    capture_output=True, check=False)
                     killed += 1
@@ -171,7 +180,7 @@ def _sweep_orphan_recorders() -> int:
     else:
         try:
             out = subprocess.run(
-                ["pgrep", "-af", "yt-dlp|ffmpeg"],
+                ["pgrep", "-af", "yt-dlp|ffmpeg|bigo_recorder.py"],
                 capture_output=True, text=True, timeout=10,
             )
             for line in (out.stdout or "").splitlines():
@@ -500,7 +509,7 @@ PLATFORM_MAP = [
     (r"stripchat\.com",          "Stripchat"),
     (r"twitcasting\.tv",         "Twitcasting"),
     (r"pandalive\.co",           "Pandalive"),
-    (r"bigo\.tv",                "Bigo"),
+    (r"bigo\.tv|bigovideo\.tv", "Bigo"),
     (r"chaturbate\.com",         "Chaturbate"),
     (r"cam4\.com",               "Cam4"),
     (r"myfreecams\.com",         "MyFreeCams"),
@@ -534,9 +543,33 @@ def _username_from_url(url: str) -> str:
     return ""
 
 
-async def fetch_metadata(url: str) -> dict:
+async def fetch_metadata(url: str, proxy: str = "") -> dict:
     # Always extract a fallback username from the URL itself
     url_username = _username_from_url(url)
+
+    if is_bigo_url(url):
+        try:
+            info = await fetch_bigo_info(url, proxy=proxy or settings.get("proxy", ""))
+            return {
+                "display_name": info.get("display_name") or url_username,
+                "username": info.get("site_id") or url_username,
+                "avatar": "",
+                "thumbnail": info.get("thumbnail") or "",
+                "is_live": bool(info.get("alive") and info.get("hls_src")),
+                "stream_title": (info.get("stream_title") or "").strip(),
+            }
+        except Exception as e:
+            logger.debug("BIGO metadata lookup failed for %s: %s", url, e)
+            if url_username:
+                return {
+                    "display_name": url_username,
+                    "username": url_username,
+                    "avatar": "",
+                    "thumbnail": "",
+                    "stream_title": "",
+                    "_lookup_error": True,
+                }
+            return {"_lookup_error": True}
 
     try:
         async with _proc_semaphore:
@@ -661,6 +694,13 @@ async def _check_chaturbate_live(url: str, proxy: str = "") -> Optional[bool]:
 
 
 async def check_is_live(url: str, proxy: str = "") -> bool:
+    if is_bigo_url(url):
+        # BIGO extraction/protocol errors are not equivalent to "offline".
+        # Let the per-channel monitor catch them so it preserves the previous
+        # live state and retries on the next poll instead of reporting a lie.
+        info = await fetch_bigo_info(url, proxy=proxy)
+        return bool(info.get("alive") and info.get("hls_src"))
+
     # For Chaturbate, try a fast HTTP scrape first before invoking yt-dlp
     if re.search(r"chaturbate\.com", url, re.I):
         result = await _check_chaturbate_live(url, proxy=proxy)
@@ -739,6 +779,31 @@ async def run_recording(rec_id: str):
     url          = rec["url"]
     platform_raw = rec.get("platform") or "Unknown"
     platform     = platform_raw.lower()
+
+    source_url = url
+    if platform == "bigo":
+        bigo_proxy = ch.get("proxy") or settings.get("proxy", "")
+        try:
+            bigo_info = await fetch_bigo_info(url, proxy=bigo_proxy)
+            source_url = bigo_info.get("hls_src") or ""
+            if not bigo_info.get("alive") or not source_url:
+                raise BigoError("BIGO channel is offline or returned no HLS stream")
+            if bigo_info.get("display_name"):
+                ch["display_name"] = bigo_info["display_name"]
+            if bigo_info.get("site_id"):
+                ch["username"] = bigo_info["site_id"]
+            if bigo_info.get("stream_title"):
+                rec["stream_title"] = bigo_info["stream_title"]
+                ch["stream_title"] = bigo_info["stream_title"]
+        except Exception as e:
+            rec["status"] = "error"
+            rec["ended_at"] = time.time()
+            rec["log"] = [f"[StreamRec] BIGO startup failed: {e}"]
+            if (ch_id := rec.get("channel_id")) and ch_id in channels:
+                channels[ch_id]["recording_id"] = None
+            _save_state()
+            logger.warning("BIGO recording startup failed for %s: %s", url, e)
+            return
 
     username     = ch.get("display_name") or ch.get("username") or rec_id
     safe_plat    = re.sub(r'[^\w\-]', '_', platform_raw)
@@ -869,7 +934,18 @@ async def run_recording(rec_id: str):
         except Exception as e:
             logger.warning("Failed to parse extra_args %r: %s", extra, e)
 
-    cmd += ["-o", str(output_path), url]
+    if platform == "bigo":
+        bigo_output = rec_dir / f"{stem}.ts"
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("bigo_recorder.py")),
+            "--url", source_url,
+            "--output", str(bigo_output),
+        ]
+        if proxy:
+            cmd += ["--proxy", proxy]
+    else:
+        cmd += ["-o", str(output_path), source_url]
 
     rec["status"]     = "recording"
     rec["started_at"] = time.time()
@@ -1009,8 +1085,15 @@ async def run_recording(rec_id: str):
         # (yt-dlp exits non-zero when broadcaster goes offline, even after a full capture)
         file_captured = bool(rec.get("filepath") and Path(rec["filepath"]).exists()
                              and Path(rec["filepath"]).stat().st_size > 0)
-        rec["status"] = "completed" if (rc == 0 or rec.get("stopping") or file_captured) else "error"
-        if rc != 0 and not rec.get("stopping") and not file_captured:
+        # yt-dlp can exit non-zero after a successful capture when a live stream ends.
+        # The native BIGO helper is different: non-zero means the HLS reader hit an
+        # actual error, so keep any partial file but mark the session failed so
+        # StreamRec's existing retry policy can recover it.
+        if platform == "bigo" and rc != 0 and not rec.get("stopping"):
+            rec["status"] = "error"
+        else:
+            rec["status"] = "completed" if (rc == 0 or rec.get("stopping") or file_captured) else "error"
+        if rc != 0 and not rec.get("stopping") and rec["status"] == "error":
             rec["error"] = f"Exit code {rc}"
             logger.warning("Recording %s failed with exit code %d", rec_id, rc)
         else:
@@ -1031,7 +1114,7 @@ async def run_recording(rec_id: str):
             size_task.cancel()
         if duration_task:
             duration_task.cancel()
-        # Make sure we never leave an orphaned yt-dlp subprocess running
+        # Make sure we never leave an orphaned recorder subprocess running
         if proc is not None and proc.returncode is None:
             try:
                 _kill_proc(proc.pid, force=False)
@@ -1048,7 +1131,7 @@ async def run_recording(rec_id: str):
         rec["ended_at"] = time.time()
         rec.pop("pid", None)
 
-        # Fall back to file glob if yt-dlp didn't print the path
+        # Fall back to file glob if the recorder didn't report the path
         if not rec.get("filepath"):
             for f in rec_dir.glob(f"{stem}.*"):
                 rec["filepath"] = str(f)
@@ -1061,11 +1144,48 @@ async def run_recording(rec_id: str):
             except Exception:
                 pass
 
+        # Native BIGO capture is written as MPEG-TS so protected HLS segments
+        # can be decoded safely. Remux to the requested container afterward.
+        fp = rec.get("filepath", "")
+        target_fmt = fmt.lower() if fmt.lower() in ("mp4", "mkv", "ts") else "ts"
+        if (
+            platform == "bigo"
+            and rec.get("status") == "completed"
+            and fp
+            and Path(fp).exists()
+            and target_fmt != "ts"
+        ):
+            target_path = str(Path(fp).with_suffix(f".{target_fmt}"))
+            try:
+                async with _proc_semaphore:
+                    remux_cmd = ["ffmpeg", "-i", fp, "-c", "copy"]
+                    if target_fmt == "mp4":
+                        remux_cmd += ["-movflags", "+faststart"]
+                    remux_cmd += ["-threads", ffmpeg_threads, target_path, "-y"]
+                    remux_proc = await asyncio.create_subprocess_exec(
+                        *remux_cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(remux_proc.wait(), timeout=REMUX_TIMEOUT)
+                if remux_proc.returncode == 0 and Path(target_path).exists():
+                    Path(fp).unlink(missing_ok=True)
+                    rec["filepath"] = target_path
+                    rec["filename"] = Path(target_path).name
+                    rec["bytes"] = Path(target_path).stat().st_size
+                else:
+                    Path(target_path).unlink(missing_ok=True)
+            except Exception:
+                try:
+                    Path(target_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
         # Remux to fix containers and move moov atom to file start for
         # smooth playback (faststart).  Run on ALL completed recordings —
         # not just manual stops — so files play without lag on any device.
         fp = rec.get("filepath", "")
-        if fp and Path(fp).exists():
+        if platform != "bigo" and fp and Path(fp).exists():
             suffix    = Path(fp).suffix
             fixed_path = str(Path(fp).with_name(Path(fp).stem + "_fixed" + suffix))
             try:
@@ -1157,7 +1277,11 @@ async def run_recording(rec_id: str):
         retry_ch_id = rec.get("channel_id")
         # Don't retry if stream ran for more than 30s — that's a natural end, not a crash
         run_duration = (rec.get("ended_at") or time.time()) - (rec.get("started_at") or time.time())
-        natural_end  = run_duration > 30 and file_captured
+        natural_end  = (
+            run_duration > 30
+            and file_captured
+            and not (platform == "bigo" and rec.get("status") == "error")
+        )
         should_retry = (
             not rec.get("stopping")
             and not natural_end
@@ -1526,7 +1650,7 @@ async def add_channel(req: AddChannelRequest):
     channels[ch_id] = ch
 
     async def _fetch_and_record():
-        meta = await fetch_metadata(req.url)
+        meta = await fetch_metadata(req.url, proxy=req.proxy)
         if meta and ch_id in channels:
             channels[ch_id].update({
                 "display_name": meta.get("display_name", ""),
@@ -1653,17 +1777,20 @@ async def refresh_channel(ch_id: str):
     # Re-detect platform in case it was saved as Unknown
     if ch.get("platform") == "Unknown" or not ch.get("platform"):
         channels[ch_id]["platform"] = detect_platform(ch["url"])
-    meta = await fetch_metadata(ch["url"])
+    proxy = ch.get("proxy") or settings.get("proxy", "")
+    meta = await fetch_metadata(ch["url"], proxy=proxy)
     if meta:
-        channels[ch_id].update({
+        updates = {
             "display_name": meta.get("display_name") or ch.get("display_name") or "",
             "username":     meta.get("username")     or ch.get("username") or "",
             "avatar":       meta.get("avatar")       or ch.get("avatar", ""),
             "thumbnail":    meta.get("thumbnail")    or ch.get("thumbnail", ""),
             "stream_title": meta.get("stream_title") or ch.get("stream_title", ""),
-            "is_live":      meta.get("is_live", False),
-            "last_checked": time.time(),
-        })
+        }
+        if not meta.get("_lookup_error"):
+            updates["is_live"] = meta.get("is_live", False)
+            updates["last_checked"] = time.time()
+        channels[ch_id].update(updates)
     _save_state()
     return channels[ch_id]
 
