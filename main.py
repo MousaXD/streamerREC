@@ -695,12 +695,11 @@ async def _check_chaturbate_live(url: str, proxy: str = "") -> Optional[bool]:
 
 async def check_is_live(url: str, proxy: str = "") -> bool:
     if is_bigo_url(url):
-        try:
-            info = await fetch_bigo_info(url, proxy=proxy)
-            return bool(info.get("alive") and info.get("hls_src"))
-        except Exception as e:
-            logger.debug("BIGO live check failed for %s: %s", url, e)
-            return False
+        # BIGO extraction/protocol errors are not equivalent to "offline".
+        # Let the per-channel monitor catch them so it preserves the previous
+        # live state and retries on the next poll instead of reporting a lie.
+        info = await fetch_bigo_info(url, proxy=proxy)
+        return bool(info.get("alive") and info.get("hls_src"))
 
     # For Chaturbate, try a fast HTTP scrape first before invoking yt-dlp
     if re.search(r"chaturbate\.com", url, re.I):
