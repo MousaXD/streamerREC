@@ -408,7 +408,7 @@ def _fetch_bigo_share_page_sync(url: str, proxy: str = "") -> str:
 
         redirect = _run_curl(
             _curl_base(proxy)
-            + ["-o", "/dev/null", "-w", "%{redirect_url}", current]
+            + ["-o", os.devnull, "-w", "%{redirect_url}", current]
         ).strip()
         if not redirect:
             return _run_curl(_curl_base(proxy) + [current])
