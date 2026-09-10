@@ -22,7 +22,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -382,6 +382,41 @@ def _fetch_studio_payload(site_id: str, proxy: str = "", token: str = "") -> dic
     return payload
 
 
+def _is_allowed_bigo_redirect(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    return (
+        parsed.scheme == "https"
+        and (
+            host == "slink.bigovideo.tv"
+            or host == "bigo.tv"
+            or host.endswith(".bigo.tv")
+        )
+    )
+
+
+def _fetch_bigo_share_page_sync(url: str, proxy: str = "") -> str:
+    """Follow BIGO share redirects manually, validating every hop."""
+    current = url
+    for _ in range(4):
+        if not _is_allowed_bigo_redirect(current):
+            raise BigoError("BIGO share link redirected outside allowed BIGO hosts")
+
+        redirect = _run_curl(
+            _curl_base(proxy)
+            + ["-o", "/dev/null", "-w", "%{redirect_url}", current]
+        ).strip()
+        if not redirect:
+            return _run_curl(_curl_base(proxy) + [current])
+
+        current = urljoin(current, redirect)
+
+    raise BigoError("BIGO share link exceeded redirect limit")
+
+
 def _resolve_site_id_sync(url: str, proxy: str = "") -> str:
     site_id = _site_id_from_bigo_url(url)
     if site_id:
@@ -390,7 +425,7 @@ def _resolve_site_id_sync(url: str, proxy: str = "") -> str:
     if not is_bigo_url(url):
         raise BigoError("URL is not a BIGO URL")
 
-    page_html = _run_curl(_curl_base(proxy) + [url])
+    page_html = _fetch_bigo_share_page_sync(url, proxy=proxy)
     site_id = _site_id_from_share_html(page_html)
     if not site_id:
         raise BigoError("Could not resolve BIGO siteId from share link")
