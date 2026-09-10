@@ -14,6 +14,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import TYPE_CHECKING
 
 from bigo import BigoError, decrypt_web_protection_prefix
@@ -73,13 +74,10 @@ class _ProtectedResponse:
                 break
 
         if len(prefix) < 376:
-            # Truncated segments cannot contain the two full protected TS
-            # packets. Preserve the bytes we did receive instead of inventing
-            # padding and corrupting the stream further.
-            yield bytes(prefix)
-            yield remainder
-            yield from iterator
-            return
+            # A protected segment without two full TS packets cannot be
+            # decrypted correctly. Fail so StreamRec marks the capture as an
+            # error and retries instead of silently saving corrupted bytes.
+            raise BigoError("truncated protected BIGO HLS segment")
 
         decrypt_web_protection_prefix(prefix, self._seed)
         yield bytes(prefix)
@@ -129,8 +127,9 @@ class BigoHLSStream(HLSStream):
 
 
 def record(url: str, output: Path, proxy: str = "") -> int:
-    if not url.startswith(("https://", "http://")):
-        raise BigoError("BIGO media URL must be HTTP or HTTPS")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise BigoError("BIGO media URL must be a valid HTTP or HTTPS URL")
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
