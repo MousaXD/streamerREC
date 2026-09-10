@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from bigo import BigoError, fetch_bigo_info, is_bigo_url
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -500,7 +501,7 @@ PLATFORM_MAP = [
     (r"stripchat\.com",          "Stripchat"),
     (r"twitcasting\.tv",         "Twitcasting"),
     (r"pandalive\.co",           "Pandalive"),
-    (r"bigo\.tv",                "Bigo"),
+    (r"bigo\.tv|bigovideo\.tv", "Bigo"),
     (r"chaturbate\.com",         "Chaturbate"),
     (r"cam4\.com",               "Cam4"),
     (r"myfreecams\.com",         "MyFreeCams"),
@@ -537,6 +538,30 @@ def _username_from_url(url: str) -> str:
 async def fetch_metadata(url: str) -> dict:
     # Always extract a fallback username from the URL itself
     url_username = _username_from_url(url)
+
+    if is_bigo_url(url):
+        try:
+            info = await fetch_bigo_info(url, proxy=settings.get("proxy", ""))
+            return {
+                "display_name": info.get("display_name") or url_username,
+                "username": info.get("site_id") or url_username,
+                "avatar": "",
+                "thumbnail": info.get("thumbnail") or "",
+                "is_live": bool(info.get("alive") and info.get("hls_src")),
+                "stream_title": (info.get("stream_title") or "").strip(),
+            }
+        except BigoError as e:
+            logger.debug("BIGO metadata lookup failed for %s: %s", url, e)
+            if url_username:
+                return {
+                    "display_name": url_username,
+                    "username": url_username,
+                    "avatar": "",
+                    "thumbnail": "",
+                    "is_live": False,
+                    "stream_title": "",
+                }
+            return {}
 
     try:
         async with _proc_semaphore:
@@ -661,6 +686,14 @@ async def _check_chaturbate_live(url: str, proxy: str = "") -> Optional[bool]:
 
 
 async def check_is_live(url: str, proxy: str = "") -> bool:
+    if is_bigo_url(url):
+        try:
+            info = await fetch_bigo_info(url, proxy=proxy)
+            return bool(info.get("alive") and info.get("hls_src"))
+        except BigoError as e:
+            logger.debug("BIGO live check failed for %s: %s", url, e)
+            return False
+
     # For Chaturbate, try a fast HTTP scrape first before invoking yt-dlp
     if re.search(r"chaturbate\.com", url, re.I):
         result = await _check_chaturbate_live(url, proxy=proxy)
@@ -739,6 +772,30 @@ async def run_recording(rec_id: str):
     url          = rec["url"]
     platform_raw = rec.get("platform") or "Unknown"
     platform     = platform_raw.lower()
+
+    source_url = url
+    if platform == "bigo":
+        bigo_proxy = ch.get("proxy") or settings.get("proxy", "")
+        try:
+            bigo_info = await fetch_bigo_info(url, proxy=bigo_proxy)
+            source_url = bigo_info.get("hls_src") or ""
+            if not bigo_info.get("alive") or not source_url:
+                raise BigoError("BIGO channel is offline or returned no HLS stream")
+            if bigo_info.get("display_name"):
+                ch["display_name"] = bigo_info["display_name"]
+            if bigo_info.get("site_id"):
+                ch["username"] = bigo_info["site_id"]
+            if bigo_info.get("stream_title"):
+                rec["stream_title"] = bigo_info["stream_title"]
+        except BigoError as e:
+            rec["status"] = "error"
+            rec["ended_at"] = time.time()
+            rec["log"] = [f"[StreamRec] BIGO startup failed: {e}"]
+            if (ch_id := rec.get("channel_id")) and ch_id in channels:
+                channels[ch_id]["recording_id"] = None
+            _save_state()
+            logger.warning("BIGO recording startup failed for %s: %s", url, e)
+            return
 
     username     = ch.get("display_name") or ch.get("username") or rec_id
     safe_plat    = re.sub(r'[^\w\-]', '_', platform_raw)
@@ -869,7 +926,7 @@ async def run_recording(rec_id: str):
         except Exception as e:
             logger.warning("Failed to parse extra_args %r: %s", extra, e)
 
-    cmd += ["-o", str(output_path), url]
+    cmd += ["-o", str(output_path), source_url]
 
     rec["status"]     = "recording"
     rec["started_at"] = time.time()
