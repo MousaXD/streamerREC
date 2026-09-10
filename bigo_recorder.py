@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING
 
-from bigo import BigoError, decrypt_web_protection_prefix
+from bigo import BIGO_USER_AGENT, BigoError, decrypt_web_protection_prefix
 from streamlink import Streamlink
 from streamlink.session.http import SSLContextAdapter
 from streamlink.stream.hls import (
@@ -136,6 +136,11 @@ def record(url: str, output: Path, proxy: str = "") -> int:
 
     session = Streamlink()
     session.http.mount("https://", TLS12Adapter())
+    session.set_option("http-headers", {
+        "User-Agent": BIGO_USER_AGENT,
+        "Referer": "https://www.bigo.tv/",
+        "Origin": "https://www.bigo.tv",
+    })
     session.set_option("stream-segment-attempts", 5)
     session.set_option("stream-segment-timeout", 20.0)
     session.set_option("stream-timeout", 45.0)
