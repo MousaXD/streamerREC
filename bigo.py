@@ -31,10 +31,11 @@ from Crypto.Util.Padding import pad
 BIGO_API = "https://ta.bigo.tv/official_website/studio/getInternalStudioInfo"
 _BIGO_SEC_HOST = "https://sec.bigo.sg"
 _BIGO_TOKEN_PASSPHRASE = b"undefinedval0x01"
-_USER_AGENT = (
+BIGO_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) "
     "Gecko/20100101 Firefox/119.0"
 )
+_USER_AGENT = BIGO_USER_AGENT
 _SAFE_SITE_ID = re.compile(r"^[A-Za-z0-9_.-]{2,128}$")
 
 
