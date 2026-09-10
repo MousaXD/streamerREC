@@ -10,6 +10,7 @@ workaround to BIGO avoids weakening TLS for other platforms.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import html as html_lib
 import json
 import re
@@ -29,6 +30,35 @@ _SAFE_SITE_ID = re.compile(r"^[A-Za-z0-9_.-]{2,128}$")
 
 class BigoError(RuntimeError):
     """Raised when a BIGO URL cannot be resolved or queried safely."""
+
+
+def decrypt_web_protection_prefix(packets: bytearray, seed: int) -> None:
+    """Decrypt BIGO's protected bytes in the first two MPEG-TS packets in-place.
+
+    BIGO's EXT-X-BIGO-WEB-PROTECTION tag supplies a per-playlist SEED. Only
+    the first 16 bytes of each of the first two 188-byte TS packets are
+    obfuscated. The algorithm is adapted from Streamlink's BIGO plugin fix.
+    """
+    if len(packets) < 376:
+        raise BigoError("protected BIGO segment prefix is shorter than two TS packets")
+
+    for packet_index in range(2):
+        mixed = ctypes.c_uint32((packet_index + 1) * 2654435769).value
+        state = ctypes.c_uint32(seed ^ mixed).value
+        if state == 0:
+            state = 1831565813
+
+        packet_offset = 188 * packet_index
+        for offset in range(16):
+            state ^= ctypes.c_uint32(state << 13).value
+            state ^= state >> 17
+            state ^= ctypes.c_uint32(state << 5).value
+            state = ctypes.c_uint32(state).value
+
+            mask = state & 0xFF
+            if mask == 0:
+                mask = 165
+            packets[packet_offset + offset] ^= mask
 
 
 @dataclass(frozen=True)
