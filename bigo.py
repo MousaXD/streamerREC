@@ -17,7 +17,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 BIGO_API = "https://ta.bigo.tv/official_website/studio/getInternalStudioInfo"
@@ -231,16 +231,15 @@ def _resolve_site_id_sync(url: str, proxy: str = "") -> str:
 def _fetch_bigo_info_sync(url: str, proxy: str = "") -> BigoInfo:
     site_id = _resolve_site_id_sync(url, proxy=proxy)
 
+    api_url = f"{BIGO_API}?siteId={quote(site_id, safe='')}&verify="
     cmd = _curl_base(proxy) + [
+        "-X",
+        "POST",
         "-H",
         "Accept: application/json",
         "-H",
-        "Content-Type: application/x-www-form-urlencoded; charset=UTF-8",
-        "-H",
         "Referer: https://www.bigo.tv/",
-        "--data-urlencode",
-        f"siteId={site_id}",
-        BIGO_API,
+        api_url,
     ]
     raw = _run_curl(cmd)
 
