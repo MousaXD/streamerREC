@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from bigo import (
+    BIGO_API,
     BigoError,
     _curl_base,
     _fetch_bigo_info_sync,
@@ -99,6 +100,11 @@ class BigoTransportTests(unittest.TestCase):
         self.assertEqual(info.display_name, "Example")
         self.assertEqual(info.stream_title, "Live now")
         self.assertEqual(info.room_id, "123")
+        cmd = run_curl.call_args.args[0]
+        self.assertIn("-X", cmd)
+        self.assertIn("POST", cmd)
+        api_url = next(arg for arg in cmd if arg.startswith(BIGO_API))
+        self.assertEqual(api_url, f"{BIGO_API}?siteId=J8023&verify=")
 
 
 class BigoProtectionTests(unittest.TestCase):
