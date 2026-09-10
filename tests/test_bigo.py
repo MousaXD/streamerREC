@@ -8,6 +8,7 @@ from bigo import (
     _curl_base,
     _evp_bytes_to_key,
     _fetch_bigo_info_sync,
+    _fetch_bigo_share_page_sync,
     _fetch_studio_payload,
     _mint_bigo_token_sync,
     _parse_jsonp,
@@ -47,6 +48,28 @@ class BigoUrlTests(unittest.TestCase):
 
     def test_rejects_invalid_site_id(self):
         self.assertEqual(_site_id_from_bigo_url("https://www.bigo.tv/%2Fetc%2Fpasswd"), "")
+
+    @patch("bigo._run_curl")
+    def test_share_redirects_are_followed_with_bigo_host_allowlist(self, run_curl):
+        run_curl.side_effect = [
+            "https://www.bigo.tv/cn/share?h=716418802",
+            "",
+            '<meta property="al:web:url" content="https://www.bigo.tv/cn/share?h=716418802">',
+        ]
+        body = _fetch_bigo_share_page_sync(
+            "https://slink.bigovideo.tv/4ABaKo?sc=4ABaKo"
+        )
+        self.assertIn("716418802", body)
+        self.assertEqual(run_curl.call_count, 3)
+
+    @patch("bigo._run_curl")
+    def test_share_redirect_to_non_bigo_host_is_rejected(self, run_curl):
+        run_curl.return_value = "https://127.0.0.1/internal"
+        with self.assertRaises(BigoError):
+            _fetch_bigo_share_page_sync(
+                "https://slink.bigovideo.tv/4ABaKo?sc=4ABaKo"
+            )
+        self.assertEqual(run_curl.call_count, 1)
 
 
 class BigoTransportTests(unittest.TestCase):
