@@ -6,7 +6,11 @@ from bigo import (
     BIGO_API,
     BigoError,
     _curl_base,
+    _evp_bytes_to_key,
     _fetch_bigo_info_sync,
+    _fetch_studio_payload,
+    _mint_bigo_token_sync,
+    _parse_jsonp,
     _site_id_from_bigo_url,
     _site_id_from_share_html,
     decrypt_web_protection_prefix,
@@ -103,8 +107,83 @@ class BigoTransportTests(unittest.TestCase):
         cmd = run_curl.call_args.args[0]
         self.assertIn("-X", cmd)
         self.assertIn("POST", cmd)
-        api_url = next(arg for arg in cmd if arg.startswith(BIGO_API))
-        self.assertEqual(api_url, f"{BIGO_API}?siteId=J8023&verify=")
+        self.assertEqual(cmd[-1], BIGO_API)
+        self.assertIn("--data-urlencode", cmd)
+        self.assertIn("siteId=J8023", cmd)
+        self.assertIn("verify=", cmd)
+
+    @patch("bigo._resolve_site_id_sync", return_value="J8023")
+    @patch("bigo._mint_bigo_token_sync", return_value="fresh-token")
+    @patch("bigo._fetch_studio_payload")
+    def test_live_room_without_source_retries_once_with_fresh_token(
+        self, fetch_studio, mint_token, _resolve
+    ):
+        fetch_studio.side_effect = [
+            {
+                "code": 0,
+                "data": {
+                    "alive": 1,
+                    "roomId": "123",
+                    "hls_src": "",
+                    "nick_name": "Example",
+                },
+            },
+            {
+                "code": 0,
+                "data": {
+                    "alive": 1,
+                    "roomId": "123",
+                    "hls_src": "https://cdn.example.invalid/live.m3u8",
+                    "nick_name": "Example",
+                },
+            },
+        ]
+
+        info = _fetch_bigo_info_sync("https://www.bigo.tv/J8023")
+
+        self.assertTrue(info.alive)
+        self.assertEqual(info.hls_src, "https://cdn.example.invalid/live.m3u8")
+        mint_token.assert_called_once_with(proxy="")
+        self.assertEqual(fetch_studio.call_count, 2)
+        self.assertEqual(fetch_studio.call_args_list[1].kwargs["token"], "fresh-token")
+
+    @patch("bigo._resolve_site_id_sync", return_value="J8023")
+    @patch("bigo._mint_bigo_token_sync", return_value="fresh-token")
+    @patch("bigo._fetch_studio_payload")
+    def test_live_room_still_without_source_fails_instead_of_false_offline(
+        self, fetch_studio, _mint_token, _resolve
+    ):
+        fetch_studio.return_value = {
+            "code": 0,
+            "data": {"alive": 1, "roomId": "123", "hls_src": ""},
+        }
+        with self.assertRaises(BigoError):
+            _fetch_bigo_info_sync("https://www.bigo.tv/J8023")
+
+    def test_jsonp_parser_accepts_callback_wrapper(self):
+        payload = _parse_jsonp('cb({"code":0,"time":"123"});')
+        self.assertEqual(payload["code"], 0)
+        self.assertEqual(payload["time"], "123")
+
+    def test_evp_bytes_to_key_matches_known_vector(self):
+        key, iv = _evp_bytes_to_key(b"undefinedval0x01", b"12345678")
+        self.assertEqual(
+            key.hex(),
+            "2e8659e5b6d14b258d16d7a5cee673c01ff7c35ada1cef113c96b315115b26a9",
+        )
+        self.assertEqual(iv.hex(), "b5bc371c83633a20302cb2972f961721")
+
+    @patch("bigo._run_curl")
+    def test_integrity_token_mint_uses_server_time_then_status(self, run_curl):
+        run_curl.side_effect = [
+            'jsonpcallback_1({"code":0,"time":"12345"});',
+            'jsonpcallback_2({"code":0,"token":"token-abc"});',
+        ]
+        token = _mint_bigo_token_sync()
+        self.assertEqual(token, "token-abc")
+        self.assertEqual(run_curl.call_count, 2)
+        self.assertTrue(any("sec.bigo.sg/v1/webjs/t" in arg for arg in run_curl.call_args_list[0].args[0]))
+        self.assertTrue(any("sec.bigo.sg/v1/webjs/status" in arg for arg in run_curl.call_args_list[1].args[0]))
 
 
 class BigoProtectionTests(unittest.TestCase):
