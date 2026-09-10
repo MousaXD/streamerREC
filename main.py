@@ -566,10 +566,10 @@ async def fetch_metadata(url: str, proxy: str = "") -> dict:
                     "username": url_username,
                     "avatar": "",
                     "thumbnail": "",
-                    "is_live": False,
                     "stream_title": "",
+                    "_lookup_error": True,
                 }
-            return {}
+            return {"_lookup_error": True}
 
     try:
         async with _proc_semaphore:
@@ -1777,17 +1777,20 @@ async def refresh_channel(ch_id: str):
     # Re-detect platform in case it was saved as Unknown
     if ch.get("platform") == "Unknown" or not ch.get("platform"):
         channels[ch_id]["platform"] = detect_platform(ch["url"])
-    meta = await fetch_metadata(ch["url"])
+    proxy = ch.get("proxy") or settings.get("proxy", "")
+    meta = await fetch_metadata(ch["url"], proxy=proxy)
     if meta:
-        channels[ch_id].update({
+        updates = {
             "display_name": meta.get("display_name") or ch.get("display_name") or "",
             "username":     meta.get("username")     or ch.get("username") or "",
             "avatar":       meta.get("avatar")       or ch.get("avatar", ""),
             "thumbnail":    meta.get("thumbnail")    or ch.get("thumbnail", ""),
             "stream_title": meta.get("stream_title") or ch.get("stream_title", ""),
-            "is_live":      meta.get("is_live", False),
-            "last_checked": time.time(),
-        })
+        }
+        if not meta.get("_lookup_error"):
+            updates["is_live"] = meta.get("is_live", False)
+            updates["last_checked"] = time.time()
+        channels[ch_id].update(updates)
     _save_state()
     return channels[ch_id]
 
