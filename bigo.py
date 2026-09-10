@@ -143,7 +143,9 @@ def _site_id_from_share_html(page_html: str) -> str:
 def _curl_base(proxy: str = "") -> list[str]:
     cmd = [
         "curl",
-        "-fsSL",
+        "-fsS",
+        "--proto",
+        "=https",
         "--tls-max",
         "1.2",
         "--connect-timeout",
@@ -165,6 +167,8 @@ def _run_curl(cmd: list[str]) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=25,
             check=False,
         )
@@ -228,9 +232,14 @@ def _fetch_bigo_info_sync(url: str, proxy: str = "") -> BigoInfo:
     if not isinstance(data, dict):
         raise BigoError("BIGO response is missing room data")
 
-    hls_src = str(data.get("hls_src") or "")
+    hls_src = str(data.get("hls_src") or "").strip()
+    if hls_src:
+        parsed_hls = urlparse(hls_src)
+        if parsed_hls.scheme not in ("http", "https") or not parsed_hls.hostname:
+            raise BigoError("BIGO returned an invalid HLS URL")
+
     alive_raw = data.get("alive")
-    alive = bool(hls_src) or alive_raw in (1, "1", True)
+    alive = alive_raw in (1, "1", True)
 
     return BigoInfo(
         site_id=site_id,
