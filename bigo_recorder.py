@@ -39,6 +39,7 @@ class TLS12Adapter(SSLContextAdapter):
 
     def get_ssl_context(self) -> ssl.SSLContext:
         context = super().get_ssl_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.maximum_version = ssl.TLSVersion.TLSv1_2
         return context
 
