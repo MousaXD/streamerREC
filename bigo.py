@@ -92,8 +92,7 @@ def is_bigo_url(url: str) -> bool:
     return (
         host == "bigo.tv"
         or host.endswith(".bigo.tv")
-        or host == "bigovideo.tv"
-        or host.endswith(".bigovideo.tv")
+        or host == "slink.bigovideo.tv"
     )
 
 
