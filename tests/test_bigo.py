@@ -174,6 +174,17 @@ class BigoTransportTests(unittest.TestCase):
         self.assertEqual(iv.hex(), "b5bc371c83633a20302cb2972f961721")
 
     @patch("bigo._run_curl")
+    def test_tokenized_studio_request_uses_form_fields(self, run_curl):
+        run_curl.return_value = '{"code":0,"data":{"alive":1,"hls_src":"https://cdn.invalid/live.m3u8"}}'
+        _fetch_studio_payload("J8023", token="token-abc")
+        cmd = run_curl.call_args.args[0]
+        self.assertEqual(cmd[-1], BIGO_API)
+        self.assertIn("siteId=J8023", cmd)
+        self.assertIn("verify=", cmd)
+        self.assertIn("token=token-abc", cmd)
+        self.assertIn("supportHevc=1", cmd)
+
+    @patch("bigo._run_curl")
     def test_integrity_token_mint_uses_server_time_then_status(self, run_curl):
         run_curl.side_effect = [
             'jsonpcallback_1({"code":0,"time":"12345"});',
