@@ -38,5 +38,48 @@ class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
+    async def test_refresh_preserves_live_state_on_bigo_lookup_error(self):
+        ch_id = "auditbigo"
+        previous = main.channels.get(ch_id)
+        main.channels[ch_id] = {
+            "id": ch_id,
+            "url": "https://www.bigo.tv/J8023",
+            "platform": "Bigo",
+            "proxy": "socks5://proxy.example:1080",
+            "display_name": "Example",
+            "username": "J8023",
+            "avatar": "",
+            "thumbnail": "",
+            "stream_title": "Existing title",
+            "is_live": True,
+        }
+        try:
+            with (
+                patch(
+                    "main.fetch_metadata",
+                    AsyncMock(
+                        return_value={
+                            "display_name": "Example",
+                            "_lookup_error": True,
+                        }
+                    ),
+                ) as fetch_metadata,
+                patch("main._save_state"),
+            ):
+                result = await main.refresh_channel(ch_id)
+
+            self.assertTrue(result["is_live"])
+            self.assertEqual(result["stream_title"], "Existing title")
+            fetch_metadata.assert_awaited_once_with(
+                "https://www.bigo.tv/J8023",
+                proxy="socks5://proxy.example:1080",
+            )
+        finally:
+            if previous is None:
+                main.channels.pop(ch_id, None)
+            else:
+                main.channels[ch_id] = previous
+
+
 if __name__ == "__main__":
     unittest.main()
