@@ -185,6 +185,7 @@ def _curl_base(proxy: str = "") -> list[str]:
         "-fsS",
         "--proto",
         "=https",
+        "--tlsv1.2",
         "--tls-max",
         "1.2",
         "--connect-timeout",
