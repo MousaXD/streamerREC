@@ -62,6 +62,19 @@ class BigoUrlTests(unittest.TestCase):
         self.assertIn("716418802", body)
         self.assertEqual(run_curl.call_count, 3)
 
+    @patch("bigo.os.devnull", "NUL")
+    @patch("bigo._run_curl")
+    def test_share_redirect_sink_uses_platform_devnull(self, run_curl):
+        run_curl.side_effect = [
+            "",
+            '<meta property="al:web:url" content="https://www.bigo.tv/cn/share?h=716418802">',
+        ]
+        _fetch_bigo_share_page_sync(
+            "https://slink.bigovideo.tv/4ABaKo?sc=4ABaKo"
+        )
+        redirect_probe = run_curl.call_args_list[0].args[0]
+        self.assertIn("NUL", redirect_probe)
+
     @patch("bigo._run_curl")
     def test_share_redirect_to_non_bigo_host_is_rejected(self, run_curl):
         run_curl.return_value = "https://127.0.0.1/internal"
