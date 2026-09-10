@@ -128,11 +128,19 @@ app = FastAPI(title="StreamRec API", version=VERSION, lifespan=lifespan)
 
 
 def _sweep_orphan_recorders() -> int:
-    """Kill yt-dlp/ffmpeg leftovers from a previous crashed/stopped instance.
-    On startup no legit recording children exist yet, so any recorder process
-    whose command line references our recordings dir is an orphan."""
+    """Kill recorder leftovers from a previous crashed/stopped instance.
+    On startup no legit recording children exist yet, so any known recorder
+    process whose command line references our recordings dir is an orphan."""
     killed = 0
     rec_str = str(RECORDINGS_DIR)
+
+    def _is_recorder_process(name: str, cmdline: str) -> bool:
+        lname = (name or "").lower()
+        return (
+            lname in ("yt-dlp.exe", "yt-dlp", "ffmpeg", "ffmpeg.exe")
+            or (lname.startswith("python") and "bigo_recorder.py" in cmdline)
+        )
+
     try:
         import psutil  # optional dependency
     except ImportError:
@@ -140,30 +148,30 @@ def _sweep_orphan_recorders() -> int:
     if psutil is not None:
         for p in psutil.process_iter(["name", "cmdline"]):
             try:
-                name = (p.info["name"] or "").lower()
-                if name not in ("yt-dlp.exe", "yt-dlp", "ffmpeg", "ffmpeg.exe"):
-                    continue
+                name = p.info["name"] or ""
                 cmdline = " ".join(p.info["cmdline"] or [])
+                if not _is_recorder_process(name, cmdline):
+                    continue
                 if rec_str in cmdline:
                     p.kill()
                     killed += 1
             except Exception:
                 continue
     elif IS_WINDOWS:
-        # Fallback: CIM query (startup-only, so the cost is fine)
         try:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "Get-CimInstance Win32_Process | "
-                 "Where-Object { $_.Name -match '^(yt-dlp|ffmpeg)' } | "
-                 "Select-Object ProcessId, CommandLine | ConvertTo-Json"],
+                 "Where-Object { $_.Name -match '^(yt-dlp|ffmpeg|python)' } | "
+                 "Select-Object Name, ProcessId, CommandLine | ConvertTo-Json"],
                 capture_output=True, text=True, timeout=20,
             )
             data = json.loads(out.stdout or "[]")
             if isinstance(data, dict):
                 data = [data]
             for entry in data or []:
-                if rec_str in (entry.get("CommandLine") or ""):
+                cmdline = entry.get("CommandLine") or ""
+                if rec_str in cmdline and _is_recorder_process(entry.get("Name") or "", cmdline):
                     subprocess.run(["taskkill", "/F", "/PID", str(entry["ProcessId"])],
                                    capture_output=True, check=False)
                     killed += 1
@@ -172,7 +180,7 @@ def _sweep_orphan_recorders() -> int:
     else:
         try:
             out = subprocess.run(
-                ["pgrep", "-af", "yt-dlp|ffmpeg"],
+                ["pgrep", "-af", "yt-dlp|ffmpeg|bigo_recorder.py"],
                 capture_output=True, text=True, timeout=10,
             )
             for line in (out.stdout or "").splitlines():
@@ -535,13 +543,13 @@ def _username_from_url(url: str) -> str:
     return ""
 
 
-async def fetch_metadata(url: str) -> dict:
+async def fetch_metadata(url: str, proxy: str = "") -> dict:
     # Always extract a fallback username from the URL itself
     url_username = _username_from_url(url)
 
     if is_bigo_url(url):
         try:
-            info = await fetch_bigo_info(url, proxy=settings.get("proxy", ""))
+            info = await fetch_bigo_info(url, proxy=proxy or settings.get("proxy", ""))
             return {
                 "display_name": info.get("display_name") or url_username,
                 "username": info.get("site_id") or url_username,
@@ -787,7 +795,8 @@ async def run_recording(rec_id: str):
                 ch["username"] = bigo_info["site_id"]
             if bigo_info.get("stream_title"):
                 rec["stream_title"] = bigo_info["stream_title"]
-        except BigoError as e:
+                ch["stream_title"] = bigo_info["stream_title"]
+        except Exception as e:
             rec["status"] = "error"
             rec["ended_at"] = time.time()
             rec["log"] = [f"[StreamRec] BIGO startup failed: {e}"]
@@ -926,7 +935,18 @@ async def run_recording(rec_id: str):
         except Exception as e:
             logger.warning("Failed to parse extra_args %r: %s", extra, e)
 
-    cmd += ["-o", str(output_path), source_url]
+    if platform == "bigo":
+        bigo_output = rec_dir / f"{stem}.ts"
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("bigo_recorder.py")),
+            "--url", source_url,
+            "--output", str(bigo_output),
+        ]
+        if proxy:
+            cmd += ["--proxy", proxy]
+    else:
+        cmd += ["-o", str(output_path), source_url]
 
     rec["status"]     = "recording"
     rec["started_at"] = time.time()
@@ -1117,6 +1137,37 @@ async def run_recording(rec_id: str):
                 rec["bytes"] = Path(fp).stat().st_size
             except Exception:
                 pass
+
+        # Native BIGO capture is written as MPEG-TS so protected HLS segments
+        # can be decoded safely. Remux to the requested container afterward.
+        fp = rec.get("filepath", "")
+        target_fmt = fmt.lower() if fmt.lower() in ("mp4", "mkv", "ts") else "ts"
+        if platform == "bigo" and fp and Path(fp).exists() and target_fmt != "ts":
+            target_path = str(Path(fp).with_suffix(f".{target_fmt}"))
+            try:
+                async with _proc_semaphore:
+                    remux_cmd = ["ffmpeg", "-i", fp, "-c", "copy"]
+                    if target_fmt == "mp4":
+                        remux_cmd += ["-movflags", "+faststart"]
+                    remux_cmd += ["-threads", ffmpeg_threads, target_path, "-y"]
+                    remux_proc = await asyncio.create_subprocess_exec(
+                        *remux_cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(remux_proc.wait(), timeout=REMUX_TIMEOUT)
+                if remux_proc.returncode == 0 and Path(target_path).exists():
+                    Path(fp).unlink(missing_ok=True)
+                    rec["filepath"] = target_path
+                    rec["filename"] = Path(target_path).name
+                    rec["bytes"] = Path(target_path).stat().st_size
+                else:
+                    Path(target_path).unlink(missing_ok=True)
+            except Exception:
+                try:
+                    Path(target_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         # Remux to fix containers and move moov atom to file start for
         # smooth playback (faststart).  Run on ALL completed recordings —
@@ -1583,7 +1634,7 @@ async def add_channel(req: AddChannelRequest):
     channels[ch_id] = ch
 
     async def _fetch_and_record():
-        meta = await fetch_metadata(req.url)
+        meta = await fetch_metadata(req.url, proxy=req.proxy)
         if meta and ch_id in channels:
             channels[ch_id].update({
                 "display_name": meta.get("display_name", ""),
