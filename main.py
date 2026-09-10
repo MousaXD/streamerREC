@@ -1086,8 +1086,15 @@ async def run_recording(rec_id: str):
         # (yt-dlp exits non-zero when broadcaster goes offline, even after a full capture)
         file_captured = bool(rec.get("filepath") and Path(rec["filepath"]).exists()
                              and Path(rec["filepath"]).stat().st_size > 0)
-        rec["status"] = "completed" if (rc == 0 or rec.get("stopping") or file_captured) else "error"
-        if rc != 0 and not rec.get("stopping") and not file_captured:
+        # yt-dlp can exit non-zero after a successful capture when a live stream ends.
+        # The native BIGO helper is different: non-zero means the HLS reader hit an
+        # actual error, so keep any partial file but mark the session failed so
+        # StreamRec's existing retry policy can recover it.
+        if platform == "bigo" and rc != 0 and not rec.get("stopping"):
+            rec["status"] = "error"
+        else:
+            rec["status"] = "completed" if (rc == 0 or rec.get("stopping") or file_captured) else "error"
+        if rc != 0 and not rec.get("stopping") and rec["status"] == "error":
             rec["error"] = f"Exit code {rc}"
             logger.warning("Recording %s failed with exit code %d", rec_id, rc)
         else:
