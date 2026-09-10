@@ -47,3 +47,23 @@ jobs:
 
       - name: Docker build
         run: docker build -t streamerrec-bigo-audit .
+
+      - name: Container startup smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name streamerrec-bigo-smoke -p 127.0.0.1:18080:8080 streamerrec-bigo-audit
+          cleanup() {
+            docker logs streamerrec-bigo-smoke || true
+            docker rm -f streamerrec-bigo-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:18080/api/health >/tmp/health.json; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Container did not become healthy" >&2
+          exit 1
