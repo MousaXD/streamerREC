@@ -57,7 +57,7 @@ class RecorderRegressionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('http://egress:3128', create.call_args.args)
 
     async def test_startup_failure_clears_recording_pointer(self):
-        rec = {'id': 'test', 'channel_id': 'channel', 'status': 'starting', 'log': []}
+        rec = {'id': 'test', 'channel_id': 'channel', 'url': 'https://www.tiktok.com/@abc/live', 'status': 'starting', 'log': []}
         channel = {'recording_id': 'test'}
         with patch.object(main, 'recordings', {'test': rec}), patch.object(main, 'channels', {'channel': channel}), patch('main._run_recording', AsyncMock(side_effect=PermissionError('denied'))), patch('main._save_state'):
             await main.run_recording('test')

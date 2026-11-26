@@ -75,6 +75,26 @@ python -m uvicorn main:app --host 127.0.0.1 --port 8000
 
 Open `http://localhost:8000`. Recordings default to `~/StreamRec/recordings`. The manual deployment is a compatibility mode without Compose network isolation; use hardened Docker for privacy-sensitive use.
 
+## Live channels, viewer analytics, and connected accounts
+
+- **Add Channel:** choose TikTok Live or BIGO Live and enter the username / BIGO ID. StreamRec generates the canonical live URL automatically. The optional custom URL mode is for already-approved platform share links. Regular TikTok video URLs are rejected.
+- **Live audience:** channel cards show the latest reported concurrent viewer count and recording peak. A separate lightweight metadata sampler collects an actual count roughly every 30 seconds while media is being written. A missing count is unavailable, not zero; total video views, likes and popularity are not substituted. TikTok's extractor exposes `concurrent_view_count`; BIGO counts are only available if the platform explicitly supplies a concurrent field. Older recordings have no backfilled viewer data.
+- **Playback:** open any recording's in-app player and viewer timeline. Peak viewers, sample average, top moments and a seekable timeline are available for recordings with samples. Click a moment or **Jump to peak**. Offsets are wall-clock estimates from the first media bytes, not frame-accurate synchronization; stream buffering and discontinuities can shift them. Unsupported browser formats can be downloaded, with peak times still visible. Viewer samples persist in the recording index, including active samples recovered after a restart.
+- **Connected Accounts:** public streams normally need no account. Under Settings → Connected Accounts, choose the platform, sign in on its official website, and connect the session using the local browser connector (or import a Netscape `cookies.txt` file). No platform password is entered into StreamRec. See [browser connector setup](browser-extension/README.md) for the one-time Chrome/Brave/Chromium setup. The session is scoped to that platform, mode 0600, and snapshotted privately for each request. A stored session does not prove the platform accepts it; sessions can expire. Disconnecting removes the stored session for future requests, not credentials already loaded by a running recorder. Stop that recording if necessary. No additional domains, host browser directories, or Docker privileges are granted.
+
+### Offline regression verification
+
+```bash
+docker compose build streamrec
+docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp:size=256m,mode=1777,exec \
+  -e RECORDINGS_DIR=/tmp/test-recordings \
+  -v "$PWD/tests:/tests:ro" --entrypoint sh streamerrec-streamrec:latest \
+  -c 'python -m unittest discover -s /tests -p "test_*.py" -q && python /tests/smoke_live_features.py'
+```
+
+The temporary executable fixture in this **test-only** container supplies synthetic platform counts and creates real MP4 media with FFmpeg. The production container keeps its existing restrictions. No personal recordings, real cookies or external network access are needed.
+
 ## Configuration
 
 ### Environment variables
@@ -101,11 +121,9 @@ recordings/
 └── account.json      local account (only if you set a password)
 ```
 
-## Cookies / age-restricted streams
+## Cookies / sign-in-required streams
 
-1. Export cookies from your browser with an extension like *Get cookies.txt LOCALLY*
-2. Upload the `.txt` in **Settings → Cookies**
-3. Assign it per channel or globally
+Prefer **Settings → Connected Accounts** to pair the platform-scoped connector or upload a Netscape cookie file for that platform. Legacy cookie uploads remain available under Settings → Cookies; the hardened recorder only supplies cookies for the matching platform. Never upload a browser-wide cookie dump.
 
 ## Network policy
 

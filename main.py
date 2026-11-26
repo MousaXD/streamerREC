@@ -14,10 +14,11 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
 import uuid
 import ipaddress
 import socket
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,8 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, Up
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from network_policy import approved_url
+from live_features import (PLATFORMS, SAMPLE_INTERVAL, SAMPLE_MAX_AGE, platform_key, channel_url,
+    viewer_count, add_viewer_sample, viewer_summary, clip_samples, scoped_cookie_text, parse_netscape_cookies)
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -70,7 +73,7 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 _static_dir = os.environ.get("STATIC_DIR", str(Path(__file__).parent))
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 START_TIME = time.time()
 
 # ── Login rate limiting ───────────────────────────────────────────────────────
@@ -89,7 +92,10 @@ async def lifespan(app: FastAPI):
         logger.warning("Killed %d orphaned recording process(es) from a previous run", n)
     logger.info("StreamRec %s starting — %d channels loaded", VERSION, len(channels))
     task = asyncio.create_task(_supervised_monitor())
+    viewer_task = asyncio.create_task(_viewer_monitor())
     yield
+    viewer_task.cancel()
+    await asyncio.gather(viewer_task, return_exceptions=True)
     task.cancel()
     try:
         await asyncio.wait_for(task, timeout=5)
@@ -239,11 +245,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         method = request.method
         if path.startswith("/api/"):
-            if HARDENED and method not in ("GET", "HEAD", "OPTIONS"):
+            # One-time browser pairing is authenticated by a short-lived capability,
+            # not by a browser cookie. The endpoint independently checks that capability.
+            pairing = path == "/api/platform-accounts/connect" and method == "POST"
+            if HARDENED and not pairing and method not in ("GET", "HEAD", "OPTIONS"):
                 origin = request.headers.get("origin") or request.headers.get("referer")
                 if (origin and urlparse(origin).netloc != request.url.netloc) or request.headers.get("sec-fetch-site") == "cross-site":
                     return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
-            if not _is_auth_exempt(method, path):
+            if not pairing and not _is_auth_exempt(method, path):
                 acc = _load_account()
                 setup = path == "/api/account" and method == "POST" and not ACCOUNT_FILE.exists()
                 if acc or (HARDENED and not setup):
@@ -401,16 +410,61 @@ def _cookie_path(name: str) -> Optional[Path]:
     return path
 
 
-def _cookie_args(name: str = "") -> list[str]:
-    path = _cookie_path(name or settings.get("cookies_file", ""))
-    return ["--cookies", str(path)] if path and path.is_file() else []
+def _platform_cookie_name(platform: str) -> str:
+    if platform not in PLATFORMS:
+        raise ValueError("Unsupported platform")
+    return f"platform-{platform}.txt"
 
 
-def _yt_dlp_options(proxy: str = "", cookies_file: str = "") -> list[str]:
+@contextmanager
+def _cookie_snapshot(url: str, name: str = ""):
+    platform = platform_key(url)
+    selected = name
+    if not selected and platform:
+        automatic = _cookie_path(_platform_cookie_name(platform))
+        if automatic and automatic.is_file():
+            selected = automatic.name
+    selected = selected or settings.get("cookies_file", "")
+    path = _cookie_path(selected)
+    if not path or not path.is_file():
+        yield ""
+        return
+    # Read only the chosen cookie file, never the host browser profile. Each
+    # process gets its own private snapshot; downloader writes cannot race.
+    with tempfile.TemporaryDirectory(prefix="streamrec-cookies-") as directory:
+        snapshot = Path(directory) / "cookies.txt"
+        if platform:
+            if path.stat().st_size > 1024 * 1024:
+                raise ValueError("Cookie file exceeds size limit")
+            try:
+                content = scoped_cookie_text(platform, parse_netscape_cookies(path.read_text(encoding="utf-8-sig")))
+            except ValueError:
+                # An expired/other-platform session must not break public capture.
+                yield ""
+                return
+            snapshot.write_text(content, encoding="utf-8")
+        elif HARDENED:
+            yield ""
+            return
+        else:
+            shutil.copyfile(path, snapshot)
+        os.chmod(snapshot, 0o600)
+        yield str(snapshot)
+
+
+def _yt_dlp_options(proxy: str = "", cookie_path: str = "") -> list[str]:
     args = ["--ignore-config", "--no-plugin-dirs"]
     if proxy := _effective_proxy(proxy):
         args += ["--proxy", proxy]
-    return args + _cookie_args(cookies_file)
+    if cookie_path:
+        args += ["--cookies", cookie_path]
+    return args
+
+
+async def _bigo_info(url: str, proxy: str, cookie_path: str = "") -> dict:
+    if cookie_path:
+        return await fetch_bigo_info(url, proxy=proxy, cookies_file=cookie_path)
+    return await fetch_bigo_info(url, proxy=proxy)
 
 
 def _validate_hardened_options(values: dict) -> None:
@@ -500,17 +554,18 @@ def _save_state_sync():
     saved_channels = {}
     for cid, ch in list(channels.items()):
         c = dict(ch)
-        for k in ("recording_id", "is_live", "last_checked"):
+        for k in ("recording_id", "is_live", "last_checked", "viewer_count", "viewer_checked_at"):
             c.pop(k, None)
         # Strip sensitive credentials from disk-persisted state
         for k in ("ch_password",):
             c.pop(k, None)
         saved_channels[cid] = c
-    # Persist finished recordings (completed/error) so they survive restarts
+    # Persist active recording metadata too, so a crash does not discard
+    # viewer samples collected while the file was being written.
     saved_recordings = {}
     for rid, rec in list(recordings.items()):
-        if rec.get("status") in ("completed", "error", "archived"):
-            saved_recordings[rid] = rec
+        if rec.get("status") in ("completed", "error", "archived", "recording", "starting"):
+            saved_recordings[rid] = {k: v for k, v in rec.items() if k not in ("pid", "_viewer_probe_at")}
     try:
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(
@@ -546,6 +601,8 @@ def _load_state():
             ch["recording_id"] = None
             ch["is_live"]      = False
             ch["last_checked"] = None
+            ch.pop("viewer_count", None)
+            ch.pop("viewer_checked_at", None)
             # Re-detect platform for any channels saved as Unknown
             if ch.get("platform") in ("Unknown", "", None) and ch.get("url"):
                 ch["platform"] = detect_platform(ch["url"])
@@ -572,6 +629,15 @@ def _load_state():
             rec.pop("pid", None)
             rec.pop("stopping", None)
             rec.pop("speed", None)
+            rec.pop("_viewer_probe_at", None)
+            if rec.get("status") in ("recording", "starting"):
+                rec["status"] = "error"
+                rec["error"] = "Recording interrupted by server restart"
+                rec["ended_at"] = rec.get("last_media_at") or rec.get("created_at")
+                rec.setdefault("log", []).append("[StreamRec] Interrupted recording recovered from disk index")
+                if not rec.get("filepath") and rec.get("capture_path"):
+                    rec["filepath"] = rec["capture_path"]
+                    rec["filename"] = Path(rec["capture_path"]).name
             if HARDENED and rec.get("filepath"):
                 try:
                     _media_path(rec["filepath"])
@@ -643,19 +709,25 @@ def _username_from_url(url: str) -> str:
 
 
 async def fetch_metadata(url: str, proxy: str = "", cookies_file: str = "") -> dict:
+    with _cookie_snapshot(url, cookies_file) as cookie_path:
+        return await _fetch_metadata(url, proxy, cookie_path)
+
+
+async def _fetch_metadata(url: str, proxy: str, cookie_path: str) -> dict:
     # Always extract a fallback username from the URL itself
     url_username = _username_from_url(url)
     proxy = _effective_proxy(proxy or settings.get("proxy", ""))
 
     if is_bigo_url(url):
         try:
-            info = await fetch_bigo_info(url, proxy=proxy or settings.get("proxy", ""))
+            info = await _bigo_info(url, proxy or settings.get("proxy", ""), cookie_path)
             return {
                 "display_name": info.get("display_name") or url_username,
                 "username": info.get("site_id") or url_username,
                 "avatar": "",
                 "thumbnail": info.get("thumbnail") or "",
                 "is_live": bool(info.get("alive") and info.get("hls_src")),
+                "viewer_count": viewer_count(info.get("concurrent_view_count")),
                 "stream_title": (info.get("stream_title") or "").strip(),
             }
         except Exception as e:
@@ -671,14 +743,16 @@ async def fetch_metadata(url: str, proxy: str = "", cookies_file: str = "") -> d
                 }
             return {"_lookup_error": True}
 
+    proc = None
     try:
         async with _proc_semaphore:
             proc = await asyncio.create_subprocess_exec(
                 "yt-dlp", "--dump-single-json", "--no-download",
                 "--playlist-items", "1", "--socket-timeout", "15",
-                *_yt_dlp_options(proxy, cookies_file), "--", url,
+                *_yt_dlp_options(proxy, cookie_path), "--", url,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                **_subprocess_kwargs(),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
 
@@ -691,6 +765,8 @@ async def fetch_metadata(url: str, proxy: str = "", cookies_file: str = "") -> d
         else:
             data = {}
 
+        if not isinstance(data, dict):
+            data = {}
         thumbnails = data.get("thumbnails") or []
         thumbnail  = data.get("thumbnail") or (thumbnails[-1]["url"] if thumbnails else "")
         avatar = ""
@@ -714,7 +790,8 @@ async def fetch_metadata(url: str, proxy: str = "", cookies_file: str = "") -> d
             "username":     username,
             "avatar":       avatar,
             "thumbnail":    thumbnail,
-            "is_live":      bool(data.get("is_live")),
+            "is_live":      data.get("is_live") is True or data.get("live_status") == "is_live",
+            "viewer_count": viewer_count(data.get("concurrent_view_count")),
             "stream_title": (data.get("title") or "").strip(),
         }
     except Exception:
@@ -729,6 +806,13 @@ async def fetch_metadata(url: str, proxy: str = "", cookies_file: str = "") -> d
                 "stream_title": "",
             }
         return {}
+    finally:
+        if proc is not None and proc.returncode is None:
+            _kill_proc(proc.pid, force=True)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, OSError):
+                pass
 
 
 async def _try_scrape_avatar(url: str) -> str:
@@ -795,53 +879,84 @@ async def _check_chaturbate_live(url: str, proxy: str = "") -> Optional[bool]:
 
 
 async def check_is_live(url: str, proxy: str = "", cookies_file: str = "") -> bool:
+    return (await probe_live(url, proxy, cookies_file))["is_live"]
+
+
+async def probe_live(url: str, proxy: str = "", cookies_file: str = "") -> dict:
+    """One metadata request: only a concurrent live count is accepted."""
     proxy = _effective_proxy(proxy)
-    if is_bigo_url(url):
-        # BIGO extraction/protocol errors are not equivalent to "offline".
-        # Let the per-channel monitor catch them so it preserves the previous
-        # live state and retries on the next poll instead of reporting a lie.
-        info = await fetch_bigo_info(url, proxy=proxy)
-        return bool(info.get("alive") and info.get("hls_src"))
-
-    # For Chaturbate, try a fast HTTP scrape first before invoking yt-dlp
-    if re.search(r"chaturbate\.com", url, re.I):
-        result = await _check_chaturbate_live(url, proxy=proxy)
-        if result is not None:
-            return result
-
-    cmd = ["yt-dlp", "--dump-single-json", "--skip-download", "--no-warnings",
-           "--socket-timeout", "20", "--playlist-items", "1",
-           *_yt_dlp_options(proxy, cookies_file), "--", url]
-    proc = None
-    try:
-        # Hold the semaphore across the full wait so the process cap is real.
-        async with _proc_semaphore:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            try:
+    with _cookie_snapshot(url, cookies_file) as cookie_path:
+        if is_bigo_url(url):
+            info = await _bigo_info(url, proxy, cookie_path)
+            live = bool(info.get("alive") and info.get("hls_src"))
+            return {"is_live": live, "viewer_count": viewer_count(info.get("concurrent_view_count")) if live else None, "observed_at": time.time()}
+        if not HARDENED and re.search(r"chaturbate\.com", url, re.I):
+            result = await _check_chaturbate_live(url, proxy=proxy)
+            if result is not None:
+                return {"is_live": result, "viewer_count": None, "observed_at": time.time()}
+        cmd = ["yt-dlp", "--dump-single-json", "--skip-download", "--no-warnings",
+               "--socket-timeout", "20", "--playlist-items", "1",
+               *_yt_dlp_options(proxy, cookie_path), "--", url]
+        proc = None
+        try:
+            async with _proc_semaphore:
+                proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL, **_subprocess_kwargs())
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=35)
-            except asyncio.TimeoutError:
+            data = json.loads(stdout) if proc.returncode == 0 else None
+            live = isinstance(data, dict) and (data.get("is_live") is True or data.get("live_status") == "is_live")
+            return {"is_live": live, "viewer_count": viewer_count(data.get("concurrent_view_count")) if live else None, "observed_at": time.time()}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Live probe failed: %s", type(exc).__name__)
+            return {"is_live": False, "viewer_count": None, "observed_at": time.time()}
+        finally:
+            if proc and proc.returncode is None:
                 _kill_proc(proc.pid, force=True)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2)
-                except asyncio.TimeoutError:
+                except (asyncio.TimeoutError, OSError):
                     pass
-                return False
-        if proc.returncode != 0:
-            return False
-        data = json.loads(stdout)
-        return data.get("is_live") is True or data.get("live_status") == "is_live"
-    except Exception as e:
-        logger.debug("check_is_live error for %s: %s", url, e)
-        if proc and proc.returncode is None:
-            try:
-                _kill_proc(proc.pid, force=True)
-            except Exception:
-                pass
-        return False
+
+
+def _set_channel_viewers(ch: dict, count, observed_at: float):
+    ch["viewer_count"] = viewer_count(count)
+    ch["viewer_checked_at"] = observed_at
+
+
+async def _sample_recording_viewers(ch_id: str, rec_id: str):
+    ch = channels.get(ch_id)
+    rec = recordings.get(rec_id)
+    if not ch or not rec or not rec.get("media_started_at"):
+        return
+    rec["_viewer_probe_at"] = time.monotonic()
+    try:
+        if HARDENED:
+            approved_url(ch["url"])
+        info = await probe_live(ch["url"], proxy=ch.get("proxy") or settings.get("proxy", ""), cookies_file=ch.get("cookies_file", ""))
+        # Never attribute an old request to a replacement recording, nor count
+        # samples collected after the actual recording has ended.
+        if channels.get(ch_id) is not ch or ch.get("recording_id") != rec_id or rec.get("status") != "recording":
+            return
+        _set_channel_viewers(ch, info["viewer_count"], info["observed_at"])
+        if info["is_live"] and add_viewer_sample(rec, info["viewer_count"], info["observed_at"]):
+            _save_state()
+    except Exception as exc:
+        logger.debug("Viewer sample unavailable for channel %s: %s", ch_id, type(exc).__name__)
+
+
+async def _viewer_monitor():
+    while True:
+        await asyncio.sleep(5)
+        tasks = []
+        for cid, ch in list(channels.items()):
+            rid = ch.get("recording_id")
+            rec = recordings.get(rid, {})
+            if rec.get("status") == "recording" and rec.get("media_started_at") and time.monotonic() - rec.get("_viewer_probe_at", -SAMPLE_INTERVAL) >= SAMPLE_INTERVAL:
+                tasks.append(_sample_recording_viewers(cid, rid))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ── Recording ─────────────────────────────────────────────────────────────────
@@ -868,6 +983,7 @@ async def _start_recording_for_channel(ch_id: str) -> Optional[str]:
             "filepath": None, "filename": None,
             "log": [], "stopping": False, "auto": False,
             "is_favorite": False,
+            "viewer_samples": [],
         }
         channels[ch_id]["recording_id"] = rec_id
         asyncio.create_task(run_recording(rec_id))
@@ -876,7 +992,10 @@ async def _start_recording_for_channel(ch_id: str) -> Optional[str]:
 
 async def run_recording(rec_id: str):
     try:
-        await _run_recording(rec_id)
+        rec = recordings[rec_id]
+        ch = channels.get(rec["channel_id"], {})
+        with _cookie_snapshot(rec["url"], ch.get("cookies_file", "")) as cookie_path:
+            await _run_recording(rec_id, cookie_path)
     except Exception as exc:
         rec = recordings.get(rec_id)
         if rec is None:
@@ -892,7 +1011,7 @@ async def run_recording(rec_id: str):
         logger.exception("Recording %s failed before cleanup", rec_id)
 
 
-async def _run_recording(rec_id: str):
+async def _run_recording(rec_id: str, cookie_path: str = ""):
     rec = recordings[rec_id]
     ch  = channels.get(rec["channel_id"], {})
     quality      = rec.get("quality") or settings["default_quality"]
@@ -907,7 +1026,7 @@ async def _run_recording(rec_id: str):
     if platform == "bigo":
         bigo_proxy = _effective_proxy(ch.get("proxy") or settings.get("proxy", ""))
         try:
-            bigo_info = await fetch_bigo_info(url, proxy=bigo_proxy)
+            bigo_info = await _bigo_info(url, bigo_proxy, cookie_path)
             source_url = bigo_info.get("hls_src") or ""
             if not bigo_info.get("alive") or not source_url:
                 raise BigoError("BIGO channel is offline or returned no HLS stream")
@@ -1009,7 +1128,8 @@ async def _run_recording(rec_id: str):
         cmd += ["--proxy", proxy]
 
     # Only a file uploaded into the dedicated cookie directory is accepted.
-    cmd += _cookie_args(ch.get("cookies_file", ""))
+    if cookie_path:
+        cmd += ["--cookies", cookie_path]
 
     # Username / password for age-restricted sites
     ch_user = ch.get("ch_username", "")
@@ -1065,6 +1185,8 @@ async def _run_recording(rec_id: str):
         ]
         if proxy:
             cmd += ["--proxy", proxy]
+        if cookie_path:
+            cmd += ["--cookies-file", cookie_path]
     else:
         cmd += ["-o", str(output_path), "--", source_url]
 
@@ -1124,6 +1246,13 @@ async def _run_recording(rec_id: str):
                             last_bytes = sz
                             last_time = now
                             rec["bytes"] = sz
+                            if delta_bytes > 0 or not rec.get("last_media_at"):
+                                rec["last_media_at"] = now
+                            if f.suffix.lower() in (".mp4", ".mkv", ".ts", ".flv", ".webm", ".m4a", ".mp3"):
+                                rec["capture_path"] = str(f)
+                            if not rec.get("media_started_at"):
+                                rec["media_started_at"] = now
+                                _save_state()
                     except Exception:
                         pass
                     break
@@ -1370,6 +1499,7 @@ async def _run_recording(rec_id: str):
             if ch_entry and ch_entry.get("recording_id") == rec_id:
                 ch_entry["recording_id"] = None
                 ch_entry["is_live"]      = False
+                ch_entry["viewer_count"] = None
 
         _save_state()
 
@@ -1407,6 +1537,7 @@ async def _run_recording(rec_id: str):
             not rec.get("stopping")
             and not natural_end
             and rec.get("status") == "error"
+            and not any("not currently live" in line.lower() or "not live" in line.lower() for line in rec.get("log", [])[-15:])
             and settings.get("auto_retry", True)
             and retry_ch_id
             and retry_ch_id in channels
@@ -1582,7 +1713,8 @@ async def _check_one_channel(ch_id: str) -> None:
     try:
         if HARDENED:
             approved_url(ch["url"])
-        is_live = await check_is_live(ch["url"], proxy=proxy, cookies_file=ch.get("cookies_file", ""))
+        info = await probe_live(ch["url"], proxy=proxy, cookies_file=ch.get("cookies_file", ""))
+        is_live = info["is_live"]
     except Exception as e:
         logger.warning("Live check failed for %s (%s): %s", ch_id, ch.get("url"), e)
         return
@@ -1592,6 +1724,7 @@ async def _check_one_channel(ch_id: str) -> None:
         return
     channels[ch_id]["is_live"]      = is_live
     channels[ch_id]["last_checked"] = time.time()
+    _set_channel_viewers(channels[ch_id], info["viewer_count"], info["observed_at"])
     if is_live and not channels[ch_id].get("recording_id"):
         logger.info("Channel %s is live — starting auto-record", ch_id)
         try:
@@ -1636,7 +1769,9 @@ async def monitor_loop():
 # ── Request models ────────────────────────────────────────────────────────────
 
 class AddChannelRequest(BaseModel):
-    url:              str
+    url:              str = ""
+    platform:         str = ""
+    handle:           str = ""
     quality:          str  = ""
     format:           str  = ""
     monitoring:       bool = True
@@ -1721,6 +1856,13 @@ def _stop_rec(rec: dict, force: bool = False):
 
 @app.post("/api/channels")
 async def add_channel(req: AddChannelRequest):
+    if req.platform or req.handle:
+        if req.url:
+            raise HTTPException(400, "Use a platform username or a URL, not both")
+        try:
+            req.url = channel_url(req.platform, req.handle)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     req.url = _approved_channel_url(req.url)
     _validate_hardened_options(req.model_dump())
     # Validate URL — must be http/https to prevent SSRF
@@ -1785,9 +1927,15 @@ async def add_channel(req: AddChannelRequest):
                 "thumbnail":    meta.get("thumbnail", ""),
                 "stream_title": meta.get("stream_title", ""),
                 "is_live":      meta.get("is_live", False),
+                "viewer_count": meta.get("viewer_count"),
+                "viewer_checked_at": time.time(),
                 "last_checked": time.time(),
             })
             _save_state()
+            if meta.get("is_live") and channels[ch_id].get("monitoring", True) and not channels[ch_id].get("recording_id"):
+                rid = await _start_recording_for_channel(ch_id)
+                if rid and rid in recordings:
+                    recordings[rid]["auto"] = True
 
     asyncio.create_task(_fetch_and_record())
     if req.record_now:
@@ -1802,6 +1950,9 @@ async def list_channels():
     result = []
     for ch in channels.values():
         c = dict(ch)
+        c.pop("ch_password", None)
+        if not c.get("is_live") or time.time() - (c.get("viewer_checked_at") or 0) > SAMPLE_MAX_AGE:
+            c["viewer_count"] = None
         rec_id = c.get("recording_id")
         if rec_id and rec_id in recordings:
             r = recordings[rec_id]
@@ -1810,6 +1961,7 @@ async def list_channels():
             c["rec_speed"]   = r.get("speed")
             c["rec_started"] = r.get("started_at")
             c["rec_id"]      = rec_id
+            c["viewer_peak"] = viewer_summary(r.get("viewer_samples", []))["peak_viewers"]
         else:
             c["rec_status"] = None; c["rec_bytes"] = 0
             c["rec_speed"]  = None; c["rec_started"] = None; c["rec_id"] = None
@@ -1920,6 +2072,8 @@ async def refresh_channel(ch_id: str):
         if not meta.get("_lookup_error"):
             updates["is_live"] = meta.get("is_live", False)
             updates["last_checked"] = time.time()
+            updates["viewer_count"] = meta.get("viewer_count")
+            updates["viewer_checked_at"] = time.time()
         channels[ch_id].update(updates)
     _save_state()
     return channels[ch_id]
@@ -2002,6 +2156,8 @@ async def list_recordings():
         r = dict(rec)
         r.pop("log", None)
         r.pop("pid", None)
+        r.pop("_viewer_probe_at", None)
+        r["viewer_summary"] = viewer_summary(r.pop("viewer_samples", []))
         # Include channel info for richer frontend display
         if ch_id := rec.get("channel_id"):
             ch = channels.get(ch_id, {})
@@ -2010,6 +2166,27 @@ async def list_recordings():
             r["channel_avatar"]     = ch.get("avatar", "")
         result.append(r)
     return sorted(result, key=lambda x: x["created_at"], reverse=True)
+
+
+@app.get("/api/recordings/{rec_id}/viewers")
+async def recording_viewers(rec_id: str):
+    rec = recordings.get(rec_id)
+    if not rec:
+        raise HTTPException(404, "Recording not found")
+    samples = rec.get("viewer_samples", [])
+    elapsed = rec.get("clip_duration_seconds")
+    if elapsed is None:
+        elapsed = max(0, (rec.get("last_media_at") or rec.get("ended_at") or time.time()) - (rec.get("media_started_at") or rec.get("started_at") or rec.get("created_at") or time.time()))
+    playable = False
+    if rec.get("filepath") and rec.get("status") not in ("recording", "starting"):
+        try:
+            path = _media_path(rec["filepath"]) if HARDENED else Path(rec["filepath"])
+            playable = path.is_file() and path.stat().st_size > 0
+        except (ValueError, OSError, TypeError):
+            pass
+    return {"samples": samples, "summary": viewer_summary(samples), "interval_seconds": SAMPLE_INTERVAL,
+            "timing": "approximate", "status": rec.get("status"), "elapsed_seconds": elapsed,
+            "filename": rec.get("filename"), "playable": playable}
 
 
 @app.get("/api/recordings/{rec_id}/log")
@@ -2152,6 +2329,9 @@ async def preview_recording(rec_id: str, request: Request):
     content_type = (
         "video/mp4"        if suffix == ".mp4" else
         "video/x-matroska" if suffix == ".mkv" else
+        "audio/mpeg" if suffix == ".mp3" else
+        "audio/mp4" if suffix == ".m4a" else
+        "video/webm" if suffix == ".webm" else
         "video/mp2t"
     )
 
@@ -2276,6 +2456,8 @@ async def cut_recording(rec_id: str, req: CutRecordingRequest):
             "log": [f"[StreamRec] Highlight clip created from {rec_id} ({int(duration)}s)"],
             "stopping": False,
             "auto": False,
+            "viewer_samples": clip_samples(rec.get("viewer_samples", []), req.start_time, req.end_time),
+            "clip_duration_seconds": duration,
             "is_favorite": True,  # Auto-favorite user clips
         }
         _save_state()
@@ -2344,6 +2526,8 @@ async def upload_cookies(file: UploadFile = File(...)):
             413, f"File too large — max {MAX_COOKIES_SIZE // 1024} KiB"
         )
     safe_name = re.sub(r'[^\w\-\.]', '_', file.filename or "cookies.txt")
+    if safe_name.startswith("platform-"):
+        raise HTTPException(400, "Use Connected Accounts for platform sessions")
     try:
         dest = _cookie_path(safe_name)
         if dest is None:
@@ -2360,7 +2544,7 @@ async def upload_cookies(file: UploadFile = File(...)):
 async def list_cookies():
     files = []
     for f in sorted(COOKIES_DIR.iterdir()):
-        if f.is_file():
+        if f.is_file() and not f.name.startswith(("platform-", ".session-")):
             files.append({"filename": f.name, "size": f.stat().st_size})
     return files
 
@@ -2368,6 +2552,8 @@ async def list_cookies():
 @app.delete("/api/cookies/{filename}")
 async def delete_cookies(filename: str):
     safe = re.sub(r'[^\w\-\.]', '_', filename)
+    if safe.startswith("platform-"):
+        raise HTTPException(400, "Use Connected Accounts for platform sessions")
     try:
         dest = _cookie_path(safe)
     except ValueError as exc:
@@ -2375,6 +2561,144 @@ async def delete_cookies(filename: str):
     if not dest or not dest.exists():
         raise HTTPException(404, "Not found")
     dest.unlink()
+    return {"ok": True}
+
+
+# ── Connected platform sessions ───────────────────────────────────────────────
+
+_platform_pairings: dict[str, dict] = {}
+_PAIRING_TTL = 300
+_MAX_PLATFORM_BODY = 2 * 1024 * 1024
+
+
+def _store_platform_session(platform: str, cookies: list[dict]) -> None:
+    content = scoped_cookie_text(platform, cookies)
+    dest = _cookie_path(_platform_cookie_name(platform))
+    if dest is None:
+        raise ValueError("Unsupported platform")
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=COOKIES_DIR, prefix=".session-", delete=False) as f:
+            temp = Path(f.name)
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, dest)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+def _request_session(request: Request) -> str:
+    token = request.cookies.get("streamrec_session", "")
+    if not token and request.headers.get("authorization", "").lower().startswith("bearer "):
+        token = request.headers["authorization"][7:].strip()
+    return token
+
+
+def _prune_pairings():
+    now = time.monotonic()
+    for key, entry in list(_platform_pairings.items()):
+        if entry["expires"] <= now or not _is_valid_session(entry["session"]):
+            _platform_pairings.pop(key, None)
+
+
+@app.get("/api/platform-accounts")
+async def platform_accounts():
+    result = []
+    for key, cfg in PLATFORMS.items():
+        path = _cookie_path(_platform_cookie_name(key))
+        stored = bool(path and path.is_file())
+        available = False
+        if stored:
+            try:
+                if path.stat().st_size <= 1024 * 1024:
+                    scoped_cookie_text(key, parse_netscape_cookies(path.read_text(encoding="utf-8-sig")))
+                    available = True
+            except (ValueError, OSError, UnicodeError):
+                pass
+        result.append({"platform": key, "label": cfg["label"], "login_url": cfg["login"],
+                       "session_stored": stored, "session_available": available, "updated_at": path.stat().st_mtime if stored else None})
+    return result
+
+
+@app.post("/api/platform-accounts/{platform}/pair")
+async def pair_platform(platform: str, request: Request):
+    if platform not in PLATFORMS:
+        raise HTTPException(400, "Unsupported platform")
+    session = _request_session(request)
+    if not _is_valid_session(session):
+        raise HTTPException(401, "Log into StreamRec first")
+    _prune_pairings()
+    for key, entry in list(_platform_pairings.items()):
+        if entry["platform"] == platform and entry["session"] == session:
+            _platform_pairings.pop(key, None)
+    if len(_platform_pairings) >= 20:
+        raise HTTPException(429, "Too many active pairing codes")
+    code = secrets.token_urlsafe(24)
+    _platform_pairings[hashlib.sha256(code.encode()).hexdigest()] = {"platform": platform, "session": session, "expires": time.monotonic() + _PAIRING_TTL}
+    return {"code": code, "expires_in": _PAIRING_TTL}
+
+
+@app.post("/api/platform-accounts/connect")
+async def connect_platform(request: Request):
+    # No cookie authentication, no CORS wildcard, no password or code in URLs.
+    # The code binds one upload to the chosen platform and an active UI session.
+    code = request.headers.get("x-streamrec-pairing", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32}", code):
+        raise HTTPException(401, "Invalid or expired pairing code")
+    _prune_pairings()
+    key = hashlib.sha256(code.encode()).hexdigest()
+    entry = _platform_pairings.get(key)
+    if not entry:
+        raise HTTPException(401, "Invalid or expired pairing code")
+    if request.headers.get("content-type", "").split(";")[0].lower() != "application/json":
+        raise HTTPException(415, "JSON required")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > _MAX_PLATFORM_BODY:
+            raise HTTPException(413, "Cookie session is too large")
+    try:
+        data = json.loads(body)
+        if not isinstance(data, dict) or data.get("platform") != entry["platform"]:
+            raise ValueError("Pairing code is for another platform")
+        # Re-check after the asynchronous body read, then consume without an await.
+        _prune_pairings()
+        if _platform_pairings.pop(key, None) is None:
+            raise HTTPException(401, "Invalid or expired pairing code")
+        _store_platform_session(entry["platform"], data.get("cookies"))
+    except (ValueError, TypeError, OSError) as exc:
+        # Never echo submitted cookie content, JSON parser input or file paths.
+        raise HTTPException(400, "Could not store matching platform cookies; generate a new pairing code") from None
+    return {"ok": True, "platform": entry["platform"], "session_stored": True}
+
+
+@app.post("/api/platform-accounts/{platform}/upload")
+async def upload_platform_session(platform: str, file: UploadFile = File(...)):
+    if platform not in PLATFORMS:
+        raise HTTPException(400, "Unsupported platform")
+    data = await file.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024:
+        raise HTTPException(413, "Cookie file is too large")
+    try:
+        _store_platform_session(platform, parse_netscape_cookies(data.decode("utf-8-sig")))
+    except (ValueError, UnicodeError, OSError):
+        raise HTTPException(400, "Use a valid Netscape cookies.txt file for the selected platform") from None
+    return {"ok": True, "platform": platform, "session_stored": True}
+
+
+@app.delete("/api/platform-accounts/{platform}")
+async def disconnect_platform(platform: str):
+    if platform not in PLATFORMS:
+        raise HTTPException(400, "Unsupported platform")
+    path = _cookie_path(_platform_cookie_name(platform))
+    if path:
+        path.unlink(missing_ok=True)
+    for key, entry in list(_platform_pairings.items()):
+        if entry["platform"] == platform:
+            _platform_pairings.pop(key, None)
     return {"ok": True}
 
 
@@ -2471,7 +2795,7 @@ async def export_config():
     saved_channels = {}
     for cid, ch in channels.items():
         c = dict(ch)
-        for k in ("recording_id", "is_live", "last_checked"):
+        for k in ("recording_id", "is_live", "last_checked", "viewer_count", "viewer_checked_at"):
             c.pop(k, None)
         c.pop("ch_password", None)  # never export credentials
         saved_channels[cid] = c

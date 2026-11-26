@@ -7,6 +7,7 @@
 !bigo.py
 !bigo_recorder.py
 !network_policy.py
+!live_features.py
 !index.html
 !egress-domains.txt
 !squid.conf

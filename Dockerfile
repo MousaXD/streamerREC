@@ -15,7 +15,7 @@ RUN curl --fail --location --proto '=https' --proto-redir '=https' \
 WORKDIR /app
 COPY requirements.lock .
 RUN pip install --no-cache-dir --require-hashes -r requirements.lock && pip check
-COPY main.py bigo.py bigo_recorder.py network_policy.py index.html egress-domains.txt ./
+COPY main.py bigo.py bigo_recorder.py network_policy.py live_features.py index.html egress-domains.txt ./
 RUN mkdir -p /recordings && groupadd -g 999 streamrec \
     && useradd --system --uid 999 --gid 999 --home-dir /app --shell /usr/sbin/nologin streamrec \
     && chown streamrec:streamrec /recordings

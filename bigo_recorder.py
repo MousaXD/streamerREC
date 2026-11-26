@@ -9,6 +9,7 @@ all other platforms stay unchanged.
 from __future__ import annotations
 
 import argparse
+from http.cookiejar import MozillaCookieJar
 import ssl
 import sys
 import time
@@ -127,7 +128,7 @@ class BigoHLSStream(HLSStream):
     __parser__ = BigoM3U8Parser
 
 
-def record(url: str, output: Path, proxy: str = "") -> int:
+def record(url: str, output: Path, proxy: str = "", cookies_file: str = "") -> int:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BigoError("BIGO media URL must be a valid HTTP or HTTPS URL")
@@ -135,6 +136,18 @@ def record(url: str, output: Path, proxy: str = "") -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     session = Streamlink()
+    if cookies_file:
+        jar = MozillaCookieJar(cookies_file)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        # Netscape 0 denotes a session cookie; MozillaCookieJar otherwise
+        # interprets it as an expired Unix timestamp.
+        for cookie in list(jar):
+            if cookie.expires == 0:
+                cookie.expires = None
+                cookie.discard = True
+            elif cookie.is_expired():
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+        session.http.cookies.update(jar)
     session.http.mount("https://", TLS12Adapter())
     session.set_option("http-headers", {
         "User-Agent": BIGO_USER_AGENT,
@@ -181,10 +194,11 @@ def main() -> int:
     parser.add_argument("--url", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--proxy", default="")
+    parser.add_argument("--cookies-file", default="")
     args = parser.parse_args()
 
     try:
-        return record(args.url, Path(args.output), args.proxy)
+        return record(args.url, Path(args.output), args.proxy, args.cookies_file)
     except Exception as exc:
         print(f"[BIGO] recorder error: {exc}", file=sys.stderr, flush=True)
         return 1

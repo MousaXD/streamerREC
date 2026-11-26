@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "StreamRec Account Connector",
+  "version": "1.0.0",
+  "description": "Connect only a selected streaming platform session to your localhost StreamRec instance.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmNV7chtZxNLoGny2fp9GY22FtJ+UIsOOqFzLRixMFdaeb5kFGpSaPMsZ7D1uQRMdu1CsKb5nGhayydkALg+8sOLy5JG2q3JjroSMmxgL/GCIXFF9xz32+vPIbL0uEwMkyr0vFQtZc9oqCO1KjwMKMiRTA9cJXts0GWNDN/yQnaO+hTnQqDZXKyLzeWzUiit0nSo53luWSbkc+z8Yx7oKAilaRooNDbYpgMZRpDTT/O+wFCAcL14x1YwFHAfmI8IdMPL6/YmQ6VSjNpJ4fVJeN+Zfelqxlzjl8i1hgaM/Pw0S/p3ac4DuD8A0EZvy9QE+uhSCF42ig9g0BMpZRT2UBwIDAQAB",
+  "permissions": [
+    "cookies",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "optional_host_permissions": [
+    "https://*.tiktok.com/*",
+    "https://*.bigo.tv/*",
+    "https://*.bigo.sg/*"
+  ],
+  "externally_connectable": {
+    "matches": [
+      "http://127.0.0.1/*",
+      "http://localhost/*"
+    ]
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "StreamRec account connector",
+    "default_popup": "connect.html"
+  }
+}

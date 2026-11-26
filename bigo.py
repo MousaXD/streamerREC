@@ -10,6 +10,7 @@ workaround to BIGO avoids weakening TLS for other platforms.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import base64
 import ctypes
 import hashlib
@@ -36,6 +37,7 @@ BIGO_USER_AGENT = (
     "Gecko/20100101 Firefox/119.0"
 )
 _USER_AGENT = BIGO_USER_AGENT
+_BIGO_COOKIE_FILE = contextvars.ContextVar("bigo_cookie_file", default="")
 _SAFE_SITE_ID = re.compile(r"^[A-Za-z0-9_.-]{2,128}$")
 
 
@@ -81,6 +83,7 @@ class BigoInfo:
     thumbnail: str = ""
     hls_src: str = ""
     room_id: str = ""
+    concurrent_view_count: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +94,7 @@ class BigoInfo:
             "thumbnail": self.thumbnail,
             "hls_src": self.hls_src,
             "room_id": self.room_id,
+            "concurrent_view_count": self.concurrent_view_count,
         }
 
 
@@ -198,6 +202,8 @@ def _curl_base(proxy: str = "") -> list[str]:
     ]
     if proxy:
         cmd += ["--proxy", proxy]
+    if cookie_file := _BIGO_COOKIE_FILE.get():
+        cmd += ["--cookie", cookie_file]
     return cmd
 
 
@@ -468,6 +474,14 @@ def _fetch_bigo_info_sync(url: str, proxy: str = "") -> BigoInfo:
     if alive and room_id not in ("", "0") and not hls_src:
         raise BigoError("BIGO reports a live room but withheld the HLS stream URL")
 
+    # Accept only explicitly named concurrent counts, not cumulative views,
+    # room popularity or engagement. BIGO may omit these entirely.
+    count = None
+    from live_features import viewer_count
+    for field in ("concurrent_view_count", "concurrentViewerCount", "currentViewerCount", "onlineViewerCount"):
+        count = viewer_count(data.get(field))
+        if count is not None:
+            break
     return BigoInfo(
         site_id=site_id,
         alive=alive,
@@ -476,10 +490,15 @@ def _fetch_bigo_info_sync(url: str, proxy: str = "") -> BigoInfo:
         thumbnail=str(data.get("snapshot") or ""),
         hls_src=hls_src,
         room_id=room_id,
+        concurrent_view_count=count,
     )
 
 
-async def fetch_bigo_info(url: str, proxy: str = "") -> dict[str, Any]:
-    """Resolve a BIGO URL and fetch normalized metadata without blocking the event loop."""
-    info = await asyncio.to_thread(_fetch_bigo_info_sync, url, proxy)
-    return info.as_dict()
+async def fetch_bigo_info(url: str, proxy: str = "", cookies_file: str = "") -> dict[str, Any]:
+    """Resolve BIGO metadata; the optional cookie snapshot is scoped to this request."""
+    token = _BIGO_COOKIE_FILE.set(cookies_file)
+    try:
+        info = await asyncio.to_thread(_fetch_bigo_info_sync, url, proxy)
+        return info.as_dict()
+    finally:
+        _BIGO_COOKIE_FILE.reset(token)
