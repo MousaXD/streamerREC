@@ -115,6 +115,9 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
 .sw.on{background:var(--acc)}
 .sw.on::after{transform:translateX(14px)}
 
+/* ── Account-first recording library ── */
+.library-header{display:flex;align-items:center;gap:14px;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap}.library-header h1{font-size:23px;letter-spacing:-.025em;margin:0 0 4px}.library-header p{color:var(--dim);font-size:12px;line-height:1.5}.library-totals{display:flex;align-items:center;gap:18px}.library-total{display:grid;gap:3px;text-align:right}.library-total b{font-size:17px;letter-spacing:-.02em;font-variant-numeric:tabular-nums}.library-total span{font-size:11px;color:var(--mut)}.library-platform{margin-bottom:22px}.library-platform-head{display:flex;align-items:baseline;gap:12px;margin:0 0 9px;flex-wrap:wrap}.library-platform-head h2{font-size:15px;letter-spacing:-.01em}.library-platform-head span{font-size:11px;color:var(--dim)}.library-list{border:1px solid var(--line);background:var(--card);border-radius:12px;overflow:hidden}.library-account{width:100%;display:grid;grid-template-columns:minmax(130px,1fr) minmax(70px,110px) minmax(88px,140px) minmax(60px,100px) 18px;align-items:center;gap:16px;padding:15px 17px;text-align:left;border-bottom:1px solid var(--line);transition:.15s}.library-account:last-child{border-bottom:none}.library-account:hover,.library-account:focus-visible{background:var(--panel2);outline-offset:-2px}.library-account-id{display:flex;align-items:center;gap:12px;min-width:0}.library-icon{width:40px;height:40px;border-radius:10px;border:1px solid var(--line2);background:var(--panel2);display:grid;place-items:center;font-size:19px;flex-shrink:0}.library-account-name{min-width:0;display:grid;gap:4px}.library-account-name b,.library-account-name small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.library-account-name b{font-size:14px}.library-account-name small{font-size:11px;color:var(--mut)}.library-metric{display:grid;gap:4px;text-align:right}.library-metric b{font-size:14px;font-weight:650;font-variant-numeric:tabular-nums;white-space:nowrap}.library-metric small{font-size:10px;color:var(--mut)}.library-arrow{color:var(--dim);font-size:23px}.library-sub{font-size:11px;color:var(--dim);line-height:1.5;margin-top:6px}.library-status{font-size:10px;color:var(--ok);font-weight:500}.library-detail-head{padding:12px 0 16px}.library-detail-head h2{font-size:20px;letter-spacing:-.02em}.library-detail-head p{color:var(--dim);font-size:12px;margin-top:5px}.library-empty{padding:28px;border:1px dashed var(--line2);border-radius:12px;text-align:center;color:var(--dim);font-size:13px;line-height:1.6}.library-date{grid-column:1/-1;color:var(--dim);font-size:12px;font-weight:650;margin-top:6px}.rec-grid[hidden]{display:none!important}@media(max-width:720px){.library-account{grid-template-columns:minmax(100px,1fr) minmax(56px,auto) minmax(70px,auto) 12px;gap:9px;padding:12px}.library-account .library-size{display:none}.library-metric b{font-size:12px}.library-icon{width:32px;height:32px;font-size:16px}.library-account-id{gap:8px}.library-totals{gap:13px}.library-total{text-align:left}.library-total b{font-size:15px}}
+
 /* ── Recordings ── */
 .rec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
 .rec-card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
@@ -239,14 +242,15 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
   <!-- RECORDINGS -->
   <div class="view" id="view-recordings">
     <div class="toolbar">
+      <button class="btn btn-ghost" id="libraryBack" onclick="openLibraryRoot()" hidden>← Accounts</button>
       <div class="search">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
-        <input id="rq" placeholder="Search recordings…" oninput="renderRecordings()">
+        <input id="rq" placeholder="Search accounts…" oninput="renderRecordings()">
       </div>
       <div class="tb-spacer"></div>
-      <select class="sel" id="recSort" onchange="renderRecordings()"><option value="recent">Newest</option><option value="peak">Peak viewers</option></select><span style="font-size:12px;color:var(--mut)" id="recCount"></span>
+      <select class="sel" id="recSort" onchange="renderRecordings()"><option value="recent">Newest</option><option value="duration">Total duration</option><option value="count">Most recordings</option><option value="name">Account name</option><option value="peak">Peak viewers</option></select><span style="font-size:12px;color:var(--mut)" id="recCount"></span>
     </div>
-    <div class="scroll"><div class="rec-grid" id="recGrid"></div></div>
+    <div class="scroll" id="libraryScroll"><div id="libraryHead"></div><div id="libraryGroups"></div><div class="rec-grid" id="recGrid" hidden></div></div>
   </div>
 
   <!-- SETTINGS -->
@@ -456,6 +460,7 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
 const API='';
 let channels={}, recs={}, settings={}, acc={exists:false,authed:false}, hardened=false;
 let pollTimer=null, logCh=null, playerId=null, playerData=null, pendingSeek=null, pairTimer=null;
+let libraryAccounts=[], libraryAccount=null, librarySelected=null, libraryRequest=0, libraryLoaded=false;
 const CONNECTOR_ID="nlbijnfgpedokplanlnhdjkbngfekdja";
 
 /* helpers */
@@ -479,7 +484,7 @@ function switchView(v){
   document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
   $('tab-'+v)?.classList.add('active');$('view-'+v)?.classList.add('active');
   if(v==='settings')loadSettingsUI();
-  if(v==='recordings')fetchRecordings();
+  if(v==='recordings')openLibraryRoot();
 }
 function setPane(p,btn){document.querySelectorAll('.set-nav button').forEach(b=>b.classList.remove('active'));btn?.classList.add('active');document.querySelectorAll('.sgroup').forEach(g=>g.style.display='none');$('pane-'+p).style.display='block'}
 function tgl(el){el.classList.toggle('on')}
@@ -578,20 +583,44 @@ async function refreshLog(){
   }catch{}
 }
 
-/* recordings */
-async function fetchRecordings(){try{recs=await api('/api/recordings');renderRecordings()}catch{}}
+/* Account-first recordings library */
+function libraryTime(seconds){const n=Math.max(0,Math.round(Number(seconds)||0));const h=Math.floor(n/3600),m=Math.floor(n%3600/60),s=n%60;return h?h+'h '+m+'m':m?m+'m '+s+'s':s+'s'}
+function totalTime(a){return (a.unknown_durations?'≥ ':'')+libraryTime(a.duration_seconds)}
+function libraryTotals(rows){return rows.reduce((t,a)=>({recordings:t.recordings+a.recordings,live_recordings:t.live_recordings+a.live_recordings,clips:t.clips+a.clips,duration_seconds:t.duration_seconds+a.duration_seconds,unknown_durations:t.unknown_durations+a.unknown_durations,bytes:t.bytes+a.bytes}),{recordings:0,live_recordings:0,clips:0,duration_seconds:0,unknown_durations:0,bytes:0})}
+function openLibraryRoot(){librarySelected=null;libraryAccount=null;recs=[];$('rq').value='';$('recSort').value='recent';$('libraryScroll').scrollTop=0;renderRecordings();fetchRecordings()}
+function openLibraryAccount(id){if(!/^[a-f0-9]{24}$/.test(id))return;librarySelected=id;libraryAccount=libraryAccounts.find(a=>a.id===id)||null;recs=[];$('rq').value='';$('recSort').value='recent';$('libraryScroll').scrollTop=0;renderRecordings();fetchRecordings()}
+async function fetchRecordings(){
+  const request=++libraryRequest,id=librarySelected;
+  try{
+    if(id){const d=await api('/api/library/'+id+'/recordings');if(request!==libraryRequest||librarySelected!==id)return;libraryAccount=d.account;recs=d.recordings;}
+    else{const d=await api('/api/library');if(request!==libraryRequest||librarySelected!==null)return;libraryAccounts=d.accounts;libraryLoaded=true;recs=[];}
+    renderRecordings();
+  }catch(e){if(request!==libraryRequest)return;if(id&&e.message==='Account library not found'){openLibraryRoot();return}if(!libraryLoaded&&!id)$('libraryGroups').textContent='Could not load your library.'}
+}
+function renderLibraryAccounts(q){
+  let rows=libraryAccounts.filter(a=>!q||[a.name,a.handle,a.platform].some(v=>String(v||'').toLowerCase().includes(q)));
+  const sort=$('recSort').value,cmp={recent:(a,b)=>(b.latest_at||0)-(a.latest_at||0),duration:(a,b)=>b.duration_seconds-a.duration_seconds,count:(a,b)=>b.recordings-a.recordings,name:(a,b)=>a.name.localeCompare(b.name),peak:(a,b)=>(b.peak_viewers??-1)-(a.peak_viewers??-1)};
+  rows.sort((a,b)=>a.platform.localeCompare(b.platform)||(cmp[sort]||cmp.recent)(a,b)||a.name.localeCompare(b.name));
+  const all=libraryTotals(rows);$('recCount').textContent=rows.length+' accounts';
+  $('libraryHead').innerHTML=`<div class="library-header"><div><h1>Recording library</h1><p>Choose an account to see its recorded lives, clips and viewer peaks.</p></div><div class="library-totals"><div class="library-total"><b>${all.live_recordings.toLocaleString()}</b><span>Recorded lives</span></div><div class="library-total"><b>${totalTime(all)}</b><span>Total media time</span></div><div class="library-total"><b>${fmtB(all.bytes)}</b><span>Storage</span></div></div></div>`;
+  const platforms=new Map();for(const a of rows){if(!platforms.has(a.platform))platforms.set(a.platform,[]);platforms.get(a.platform).push(a)}
+  $('libraryGroups').innerHTML=rows.length?[...platforms].map(([p,accounts])=>{const t=libraryTotals(accounts);return `<section class="library-platform"><div class="library-platform-head"><h2>${esc(platEmoji(p))} ${esc(p==='Bigo'?'BIGO Live':p)}</h2><span>${accounts.length} ${accounts.length===1?'account':'accounts'} · ${t.live_recordings} recorded lives · ${totalTime(t)}</span></div><div class="library-list">${accounts.map(a=>`<button type="button" class="library-account" onclick="openLibraryAccount('${a.id}')"><span class="library-account-id"><span class="library-icon">${esc(platEmoji(a.platform))}</span><span class="library-account-name"><b>${esc(a.name)}</b><small>${esc(a.handle&&a.handle!==a.name?a.handle+' · ':'')}${a.monitoring?'Monitoring':'Not monitored'}${a.clips?' · '+a.clips+' clips':''}</small></span></span><span class="library-metric"><b>${a.live_recordings}</b><small>Recorded lives</small></span><span class="library-metric"><b>${totalTime(a)}</b><small>${a.unknown_durations?'Known duration':'Total duration'}</small></span><span class="library-metric library-size"><b>${fmtB(a.bytes)}</b><small>Storage</small></span><span class="library-arrow">›</span></button>`).join('')}</div></section>`}).join(''):`<div class="library-empty">${libraryLoaded?(q?'No accounts match your search.':'No accounts yet. Add a channel to start recording.'):'Loading library…'}</div>`;
+  if(all.unknown_durations)$('libraryGroups').insertAdjacentHTML('beforeend',`<p class="library-sub">${all.unknown_durations} ${all.unknown_durations===1?'file has':'files have'} unknown duration. Totals include only measured media duration and may increase when analysis finishes.</p>`);
+}
 function renderRecordings(){
-  const q=($('rq').value||'').toLowerCase();
-  const list=(Array.isArray(recs)?recs:[]).filter(r=>{
-    if(r.status==='recording'||r.status==='starting')return false;
-    if(!q)return true;
-    return((r.filename||'')+(r.channel_display_name||'')+(r.platform||'')).toLowerCase().includes(q);
-  });
-  if($('recSort').value==='peak')list.sort((a,b)=>(b.viewer_summary?.peak_viewers??-1)-(a.viewer_summary?.peak_viewers??-1)||b.created_at-a.created_at);
+  const q=($('rq').value||'').toLowerCase(),detail=!!librarySelected;
+  $('libraryBack').hidden=!detail;$('rq').placeholder=detail?'Search recordings…':'Search accounts…';$('libraryGroups').hidden=detail;$('recGrid').hidden=!detail;
+  const sort=$('recSort');for(const option of sort.options){option.hidden=detail&&['count','name'].includes(option.value);if(option.value==='duration')option.textContent=detail?'Longest':'Total duration'}
+  if(!detail){$('recGrid').innerHTML='';renderLibraryAccounts(q);return}
+  const a=libraryAccount;
+  $('libraryHead').innerHTML=a?`<div class="library-header library-detail-head"><div><h2>${esc(a.name)}</h2><p>${esc(a.platform)} · ${a.live_recordings} recorded lives${a.clips?' · '+a.clips+' clips':''} · ${totalTime(a)} total</p>${a.unknown_durations?'<p>Some file durations are not yet available.</p>':''}</div><div class="library-totals"><div class="library-total"><b>${fmtB(a.bytes)}</b><span>Storage</span></div><div class="library-total"><b>${fmtViews(a.peak_viewers)}</b><span>Peak viewers</span></div></div></div>`:'<div class="library-detail-head"><h2>Loading account…</h2></div>';
+  const list=(Array.isArray(recs)?recs:[]).filter(r=>!q||((r.filename||'')+(r.channel_display_name||'')+(r.platform||'')).toLowerCase().includes(q));
+  if(sort.value==='peak')list.sort((a,b)=>(b.viewer_summary?.peak_viewers??-1)-(a.viewer_summary?.peak_viewers??-1)||b.created_at-a.created_at);
+  else if(sort.value==='duration')list.sort((a,b)=>(b.duration_seconds??-1)-(a.duration_seconds??-1)||b.created_at-a.created_at);
   $('recCount').textContent=list.length+' recordings';
   $('recGrid').innerHTML=list.length?list.map(r=>{
     const size=r.bytes?fmtB(r.bytes):'—';
-    const dur=r.started_at&&r.ended_at?fmtClock(Math.max(0,r.ended_at-r.started_at)):'—';
+    const dur=Number.isFinite(r.duration_seconds)?fmtClock(r.duration_seconds):'—';
     return `<div class="rec-card">
     <div class="rec-thumb" onclick="openPlayer('${r.id}')" title="Open player and viewer timeline">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/><path d="M10 12l4 3-4 3z"/></svg>
@@ -610,7 +639,7 @@ function renderRecordings(){
       <button class="ibtn" title="Archive" onclick="archRec('${r.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 002 2h12a2 2 0 002-2V8M10 12h4"/></svg></button>
       <button class="ibtn" title="Delete" style="color:var(--acc)" onclick="delRec('${r.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg></button>
     </div></div>`;
-  }).join(''):'<div class="empty"><b>No recordings yet</b><span>Finished recordings will appear here.</span></div>';
+  }).join(''):'<div class="empty"><b>No saved recordings'+(q?' match your search':'')+'</b><span>Finished recordings for this account will appear here.</span></div>';
 }
 async function favRec(id,v){try{await api(`/api/recordings/${id}/favorite`,{method:'POST'});fetchRecordings()}catch{}}
 async function archRec(id){try{await api(`/api/recordings/${id}/archive`,{method:'POST'});toast('Archived');fetchRecordings()}catch(e){toast(e.message,true)}}
@@ -753,9 +782,9 @@ function openAcc(){
 }
 function closeAcc(){if(hardened&&!acc.authed)return;$('accOv').classList.remove('open');localStorage.streamrecGuestSkip='1'}
 async function createAcc(){try{await api('/api/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('acUser').value.trim(),password:$('acPass').value,confirm_password:$('acPass2').value})});toast('Account created');await loadAcc();closeAcc()}catch(e){toast(e.message,true)}}
-async function loginAcc(){try{await api('/api/account/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('alUser').value.trim(),password:$('alPass').value})});toast('Logged in');await loadAcc();closeAcc();fetchChannels()}catch(e){toast(e.message,true)}}
+async function loginAcc(){try{await api('/api/account/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('alUser').value.trim(),password:$('alPass').value})});toast('Logged in');await loadAcc();closeAcc();fetchChannels();if($('view-recordings').classList.contains('active'))fetchRecordings()}catch(e){toast(e.message,true)}}
 async function saveAcc(){const nw=$('pcNew').value;if(!nw)return toast('Enter new password');try{await api('/api/account',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:$('pcCur').value,new_password:nw,confirm_new_password:nw})});toast('Updated — sign in again');$('pcCur').value='';$('pcNew').value='';acc.authed=false;channels={};recs={};await loadAcc();openAcc()}catch(e){toast(e.message,true)}}
-async function logoutAcc(){try{await api('/api/account/logout',{method:'POST'})}catch{}closePair();closePlayer();channels={};recs=[];renderChannels();renderRecordings();acc.authed=false;renderAcc();closeAcc();openAcc()}
+async function logoutAcc(){try{await api('/api/account/logout',{method:'POST'})}catch{}closePair();closePlayer();channels={};recs=[];libraryAccounts=[];libraryAccount=null;librarySelected=null;libraryLoaded=false;libraryRequest++;renderChannels();renderRecordings();acc.authed=false;renderAcc();closeAcc();openAcc()}
 
 /* polling — pauses when tab hidden to stay light on resources */
 function startPoll(){if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval(()=>{

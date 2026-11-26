@@ -29,6 +29,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, Up
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from network_policy import approved_url
+from recording_library import build_library, probe_duration, media_duration, MEDIA_SUFFIXES, FINISHED
 from live_features import (PLATFORMS, SAMPLE_INTERVAL, SAMPLE_MAX_AGE, platform_key, channel_url,
     viewer_count, add_viewer_sample, viewer_summary, clip_samples, scoped_cookie_text, parse_netscape_cookies)
 from pydantic import BaseModel
@@ -73,7 +74,7 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 _static_dir = os.environ.get("STATIC_DIR", str(Path(__file__).parent))
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 START_TIME = time.time()
 
 # ── Login rate limiting ───────────────────────────────────────────────────────
@@ -93,9 +94,11 @@ async def lifespan(app: FastAPI):
     logger.info("StreamRec %s starting — %d channels loaded", VERSION, len(channels))
     task = asyncio.create_task(_supervised_monitor())
     viewer_task = asyncio.create_task(_viewer_monitor())
+    duration_task = asyncio.create_task(_library_duration_worker())
     yield
     viewer_task.cancel()
-    await asyncio.gather(viewer_task, return_exceptions=True)
+    duration_task.cancel()
+    await asyncio.gather(viewer_task, duration_task, return_exceptions=True)
     task.cancel()
     try:
         await asyncio.wait_for(task, timeout=5)
@@ -394,7 +397,7 @@ def _media_path(name: str) -> Path:
         raise ValueError("Path is outside recordings")
     if path.relative_to(root).parts[0] in {"cookies", "avatars"}:
         raise ValueError("Not a recording")
-    if path.suffix.lower() not in {".mp4", ".mkv", ".ts", ".mp3", ".flv", ".webm", ".m4a", ".aac", ".mov", ".ogg", ".opus", ".wav", ".m4v"}:
+    if path.suffix.lower() not in MEDIA_SUFFIXES:
         raise ValueError("Not a media file")
     return path
 
@@ -979,6 +982,8 @@ async def _start_recording_for_channel(ch_id: str) -> Optional[str]:
         recordings[rec_id] = {
             "id": rec_id, "channel_id": ch_id,
             "url": ch["url"], "platform": ch["platform"],
+            "account_display_name": ch.get("display_name") or ch.get("username"),
+            "account_username": ch.get("username"),
             "quality": ch.get("quality") or settings["default_quality"],
             "format":  ch.get("format")  or settings["default_format"],
             "status": "starting", "created_at": time.time(),
@@ -1495,6 +1500,8 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
                         pass
             except Exception:
                 pass
+
+        await _measure_recording_duration(rec)
 
         # Only clear the channel's recording pointer if it still points at US —
         # a subsequent Record click could have already started a new rec_id.
@@ -2153,23 +2160,79 @@ async def bulk_edit(req: BulkEditRequest):
 
 # ── Recording endpoints ───────────────────────────────────────────────────────
 
+def _library_media_path(rec: dict) -> Optional[Path]:
+    fp = rec.get("filepath")
+    if not fp:
+        return None
+    try:
+        path = _media_path(fp) if HARDENED else Path(fp)
+        return path if path.is_file() and path.stat().st_size > 0 else None
+    except (ValueError, OSError, TypeError):
+        return None
+
+
+async def _measure_recording_duration(rec: dict):
+    path = _library_media_path(rec)
+    if path is None:
+        return
+    # No duration estimate from a process clock; the media file is authoritative.
+    try:
+        async with _proc_semaphore:
+            duration = await probe_duration(path)
+        if rec.get("filepath") and _library_media_path(rec) == path:
+            rec["duration_seconds"] = duration
+            rec["duration_checked"] = True
+            _save_state()
+    except Exception:
+        logger.debug("Could not measure recording duration", exc_info=True)
+
+
+async def _library_duration_worker():
+    # Backfill old or crash-recovered media gradually, without probing every
+    # recording on every dashboard request. Avoid files still being finalized.
+    while True:
+        await asyncio.sleep(5)
+        busy = {c.get("recording_id") for c in channels.values()}
+        pending = [r for r in recordings.values() if r.get("status") in FINISHED
+                   and r.get("id") not in busy and not r.get("duration_checked")
+                   and media_duration(r.get("duration_seconds")) is None and _library_media_path(r)]
+        for rec in pending[:8]:
+            if recordings.get(rec.get("id")) is rec:
+                await _measure_recording_duration(rec)
+
+
+def _public_recording(rec: dict) -> dict:
+    r = dict(rec)
+    for key in ("log", "pid", "_viewer_probe_at", "duration_checked"):
+        r.pop(key, None)
+    r["viewer_summary"] = viewer_summary(r.pop("viewer_samples", []))
+    r["duration_seconds"] = media_duration(rec.get("duration_seconds"))
+    if ch_id := rec.get("channel_id"):
+        ch = channels.get(ch_id, {})
+        r["channel_thumbnail"] = ch.get("thumbnail", "")
+        r["channel_display_name"] = ch.get("display_name") or rec.get("account_display_name") or rec.get("account_username") or _username_from_url(rec.get("url") or "")
+        r["channel_avatar"] = ch.get("avatar", "")
+    return r
+
+
 @app.get("/api/recordings")
 async def list_recordings():
-    result = []
-    for rec in recordings.values():
-        r = dict(rec)
-        r.pop("log", None)
-        r.pop("pid", None)
-        r.pop("_viewer_probe_at", None)
-        r["viewer_summary"] = viewer_summary(r.pop("viewer_samples", []))
-        # Include channel info for richer frontend display
-        if ch_id := rec.get("channel_id"):
-            ch = channels.get(ch_id, {})
-            r["channel_thumbnail"]  = ch.get("thumbnail", "")
-            r["channel_display_name"] = ch.get("display_name", "")
-            r["channel_avatar"]     = ch.get("avatar", "")
-        result.append(r)
-    return sorted(result, key=lambda x: x["created_at"], reverse=True)
+    return sorted((_public_recording(r) for r in recordings.values()), key=lambda x: x["created_at"], reverse=True)
+
+
+@app.get("/api/library")
+async def list_library():
+    accounts, _ = build_library(channels, recordings, _library_media_path)
+    return {"accounts": accounts}
+
+
+@app.get("/api/library/{account_id}/recordings")
+async def account_recordings(account_id: str):
+    accounts, members = build_library(channels, recordings, _library_media_path)
+    account = next((a for a in accounts if a["id"] == account_id), None)
+    if account is None:
+        raise HTTPException(404, "Account library not found")
+    return {"account": account, "recordings": sorted((_public_recording(r) for r in members[account_id]), key=lambda r: r.get("created_at", 0), reverse=True)}
 
 
 @app.get("/api/recordings/{rec_id}/viewers")
@@ -2236,12 +2299,12 @@ async def delete_recording(rec_id: str):
             if (ch_id := rec.get("channel_id")) and ch_id in channels \
                     and channels[ch_id].get("recording_id") == rec_id:
                 channels[ch_id]["recording_id"] = None
-    recordings.pop(rec_id, None)
     if fp := rec.get("filepath"):
         try:
             (_media_path(fp) if HARDENED else Path(fp)).unlink(missing_ok=True)
-        except Exception:
-            pass
+        except (OSError, ValueError, TypeError):
+            raise HTTPException(500, "Could not delete recording file") from None
+    recordings.pop(rec_id, None)
     _save_state()
     return {"ok": True}
 
@@ -2447,6 +2510,8 @@ async def cut_recording(rec_id: str, req: CutRecordingRequest):
             "channel_id": rec.get("channel_id"),
             "url": rec.get("url"),
             "platform": rec.get("platform"),
+            "account_display_name": rec.get("account_display_name"),
+            "account_username": rec.get("account_username"),
             "quality": rec.get("quality"),
             "format": rec.get("format"),
             "status": "completed",
@@ -2462,8 +2527,10 @@ async def cut_recording(rec_id: str, req: CutRecordingRequest):
             "auto": False,
             "viewer_samples": clip_samples(rec.get("viewer_samples", []), req.start_time, req.end_time),
             "clip_duration_seconds": duration,
+            "is_clip": True,
             "is_favorite": True,  # Auto-favorite user clips
         }
+        await _measure_recording_duration(recordings[clip_rec_id])
         _save_state()
         return {"ok": True, "clip_id": clip_rec_id, "filename": dst_path.name, "bytes": dst_path.stat().st_size}
 

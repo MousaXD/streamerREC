@@ -8,6 +8,7 @@
 !bigo_recorder.py
 !network_policy.py
 !live_features.py
+!recording_library.py
 !index.html
 !squid.conf
 !Dockerfile.ingress
