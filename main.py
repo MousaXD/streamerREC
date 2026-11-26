@@ -20,6 +20,7 @@ import ipaddress
 import socket
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -472,6 +473,33 @@ def _bigo_check_message(exc: Exception) -> str:
     return "BIGO could not verify a playable live stream. Automatic checks will continue."
 
 
+@dataclass(frozen=True, repr=False)
+class _BigoResolution:
+    # Ephemeral handoff only; do not put a signed media URL or a session
+    # fingerprint in channels, recordings, saved state, or API responses.
+    url: str
+    proxy: str
+    cookie_digest: bytes
+    observed_at: float
+    info: dict
+
+
+def _bigo_cookie_digest(cookie_path: str) -> bytes:
+    return hashlib.sha256(Path(cookie_path).read_bytes()).digest() if cookie_path else b""
+
+
+def _bigo_resolution(url: str, proxy: str, cookie_path: str, info: dict) -> _BigoResolution | None:
+    if not info.get("alive") or not info.get("hls_src"):
+        return None
+    return _BigoResolution(url, proxy, _bigo_cookie_digest(cookie_path), time.monotonic(), info)
+
+
+def _usable_bigo_resolution(resolved: _BigoResolution | None, url: str, proxy: str, cookie_path: str) -> bool:
+    return bool(resolved is not None and resolved.url == url and resolved.proxy == proxy
+                and 0 <= time.monotonic() - resolved.observed_at <= 20
+                and resolved.cookie_digest == _bigo_cookie_digest(cookie_path))
+
+
 async def _bigo_info(url: str, proxy: str, cookie_path: str = "") -> dict:
     if cookie_path:
         return await fetch_bigo_info(url, proxy=proxy, cookies_file=cookie_path)
@@ -809,6 +837,7 @@ async def _fetch_metadata(url: str, proxy: str, cookie_path: str) -> dict:
                 "avatar": "",
                 "thumbnail": info.get("thumbnail") or "",
                 "is_live": bool(info.get("alive") and info.get("hls_src")),
+                "_bigo_resolution": _bigo_resolution(url, proxy, cookie_path, info),
                 "viewer_count": viewer_count(info.get("concurrent_view_count")),
                 "stream_title": (info.get("stream_title") or "").strip(),
             }
@@ -989,7 +1018,8 @@ async def probe_live(url: str, proxy: str = "", cookies_file: str = "", *, allow
             if info.get("alive") and not info.get("hls_src"):
                 raise BigoError("BIGO live room returned no HLS stream")
             live = bool(info.get("alive") and info.get("hls_src"))
-            return {"is_live": live, "viewer_count": viewer_count(info.get("concurrent_view_count")) if live else None, "observed_at": time.time()}
+            return {"is_live": live, "viewer_count": viewer_count(info.get("concurrent_view_count")) if live else None, "observed_at": time.time(),
+                    "stream_title": info.get("stream_title"), "_bigo_resolution": _bigo_resolution(url, proxy, cookie_path, info)}
         if not HARDENED and re.search(r"chaturbate\.com", url, re.I):
             result = await _check_chaturbate_live(url, proxy=proxy)
             if result is not None:
@@ -1082,7 +1112,7 @@ async def _viewer_monitor():
 
 # ── Recording ─────────────────────────────────────────────────────────────────
 
-async def _start_recording_for_channel(ch_id: str) -> Optional[str]:
+async def _start_recording_for_channel(ch_id: str, *, bigo_resolution: _BigoResolution | None = None) -> Optional[str]:
     # Per-channel lock prevents double-recording from concurrent calls
     lock = _get_recording_lock(ch_id)
     async with lock:
@@ -1109,16 +1139,16 @@ async def _start_recording_for_channel(ch_id: str) -> Optional[str]:
             "viewer_samples": [],
         }
         channels[ch_id]["recording_id"] = rec_id
-        asyncio.create_task(run_recording(rec_id))
+        asyncio.create_task(run_recording(rec_id, bigo_resolution=bigo_resolution))
         return rec_id
 
 
-async def run_recording(rec_id: str):
+async def run_recording(rec_id: str, *, bigo_resolution: _BigoResolution | None = None):
     try:
         rec = recordings[rec_id]
         ch = channels.get(rec["channel_id"], {})
         with _cookie_snapshot(rec["url"], ch.get("cookies_file", "")) as cookie_path:
-            await _run_recording(rec_id, cookie_path)
+            await _run_recording(rec_id, cookie_path, bigo_resolution=bigo_resolution)
     except Exception as exc:
         rec = recordings.get(rec_id)
         if rec is None:
@@ -1134,7 +1164,7 @@ async def run_recording(rec_id: str):
         logger.exception("Recording %s failed before cleanup", rec_id)
 
 
-async def _run_recording(rec_id: str, cookie_path: str = ""):
+async def _run_recording(rec_id: str, cookie_path: str = "", *, bigo_resolution: _BigoResolution | None = None):
     rec = recordings[rec_id]
     ch  = channels.get(rec["channel_id"], {})
     quality      = rec.get("quality") or settings["default_quality"]
@@ -1195,7 +1225,10 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
         bigo_proxy = _effective_proxy(ch.get("proxy") or settings.get("proxy", ""))
         status, message = "unknown", None
         try:
-            bigo_info = await _bigo_info(url, bigo_proxy, cookie_path)
+            if _usable_bigo_resolution(bigo_resolution, url, bigo_proxy, cookie_path):
+                bigo_info = bigo_resolution.info
+            else:
+                bigo_info = await _bigo_info(url, bigo_proxy, cookie_path)
             source_url = bigo_info.get("hls_src") or ""
             if not bigo_info.get("alive"):
                 status, message = "offline", "BIGO reports the channel is currently offline."
@@ -1955,7 +1988,11 @@ async def _check_one_channel(ch_id: str) -> None:
     if is_live and not channels[ch_id].get("recording_id"):
         logger.info("Channel %s is live — starting auto-record", ch_id)
         try:
-            rec_id = await _start_recording_for_channel(ch_id)
+            resolution = info.get("_bigo_resolution")
+            if resolution is not None:
+                rec_id = await _start_recording_for_channel(ch_id, bigo_resolution=resolution)
+            else:
+                rec_id = await _start_recording_for_channel(ch_id)
         except Exception as e:
             logger.exception("Failed to start auto-record for %s: %s", ch_id, e)
             return
@@ -2163,7 +2200,11 @@ async def add_channel(req: AddChannelRequest):
             _remember_capture_engine(channels[ch_id], meta)
             _save_state()
             if meta.get("is_live") and channels[ch_id].get("monitoring", True) and not channels[ch_id].get("recording_id"):
-                rid = await _start_recording_for_channel(ch_id)
+                resolution = meta.get("_bigo_resolution")
+                if resolution is not None:
+                    rid = await _start_recording_for_channel(ch_id, bigo_resolution=resolution)
+                else:
+                    rid = await _start_recording_for_channel(ch_id)
                 if rid and rid in recordings:
                     recordings[rid]["auto"] = True
 
@@ -2316,7 +2357,11 @@ async def refresh_channel(ch_id: str):
         if not ch.get("recording_id"):
             _remember_capture_engine(ch, meta)
             if meta.get("is_live") and (ch.get("monitoring", True) or settings.get("record_on_add", False)):
-                rid = await _start_recording_for_channel(ch_id)
+                resolution = meta.get("_bigo_resolution")
+                if resolution is not None:
+                    rid = await _start_recording_for_channel(ch_id, bigo_resolution=resolution)
+                else:
+                    rid = await _start_recording_for_channel(ch_id)
                 if rid and rid in recordings:
                     recordings[rid]["auto"] = True
     _save_state()
