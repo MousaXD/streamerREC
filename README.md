@@ -60,7 +60,7 @@ docker compose up -d
 
 Open `http://127.0.0.1:8080` and create a password-protected account (at least 12 characters). Recordings land in `./recordings`.
 
-The default Compose deployment is hardened: the recorder runs as UID/GID 999 without Linux capabilities, with a read-only root filesystem, a private internal network and a localhost-only published port. A fixed-target unprivileged relay publishes the dashboard on localhost without giving the recorder a route to the internet. A separate unprivileged Squid proxy allows HTTP/HTTPS to public internet destinations, including streaming APIs and CDN domains, without a domain whitelist. Private, loopback, link-local, reserved and nonstandard destination ports remain blocked. Other supported platforms can be added by public URL without rebuilding. External browser thumbnails, webhooks, custom proxies and custom downloader flags are disabled in this mode. HTTPS tunnels are not TLS-inspected. Public-web egress is less restrictive than a domain allowlist: a compromised recorder or dependency could send its accessible data to public destinations. Container isolation does not make code injection impossible.
+The default Compose deployment is hardened: the recorder runs as UID/GID 999 without Linux capabilities, with a read-only root filesystem, a private internal network and a localhost-only published port. A fixed-target unprivileged relay publishes the dashboard on localhost without giving the recorder a route to the internet. A separate unprivileged Squid proxy allows HTTP/HTTPS to public internet destinations, including streaming APIs and CDN domains, without a domain whitelist. Private, loopback, link-local and reserved destinations remain blocked. Nonstandard ports are blocked except CONNECT to public `cubetecn.com` CDN hosts on ports 1450-1469 for BIGO HLS; user-entered channel URLs still require standard ports. Other supported platforms can be added by public URL without rebuilding. External browser thumbnails, webhooks, custom proxies and custom downloader flags are disabled in this mode. HTTPS tunnels are not TLS-inspected. Public-web egress is less restrictive than a domain allowlist: a compromised recorder or dependency could send its accessible data to public destinations. Container isolation does not make code injection impossible.
 
 For an existing rootless Docker installation, ensure the recording directory is writable by the container's *mapped* UID (not necessarily host UID 999). Inspect the mapping with `docker compose exec streamrec cat /proc/self/uid_map`; grant a narrowly scoped ACL to the mapped UID on `recordings` only, never change ownership or permissions of your entire home directory. Back up `recordings/state.json` and any account file before migrating. A fresh directory can be initialized with the same scoped access. Do not commit recordings, credentials or exported configuration.
 
@@ -96,6 +96,18 @@ docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-
 ```
 
 The temporary executable fixture in this **test-only** container supplies synthetic platform counts and creates real MP4 media with FFmpeg. The production container keeps its existing restrictions. No personal recordings, real cookies or external network access are needed.
+
+Verify the Squid destination and BIGO CDN port policy without external network access:
+
+```bash
+docker compose build egress
+docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp:size=32m,mode=1777 --tmpfs /run:size=8m,mode=1777 \
+  --tmpfs /var/log/squid:size=8m,mode=1777 --tmpfs /var/spool/squid:size=16m,mode=1777 \
+  --add-host private-check.cubetecn.com:127.0.0.1 --add-host public-check.cubetecn.com:8.8.8.8 \
+  -v "$PWD/tests/check_egress_policy.py:/tmp/check_egress_policy.py:ro" \
+  --entrypoint python streamerrec-egress /tmp/check_egress_policy.py
+```
 
 ## Configuration
 
