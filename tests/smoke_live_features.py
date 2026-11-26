@@ -33,6 +33,8 @@ sys.exit(0)
 with tempfile.TemporaryDirectory(prefix='streamrec-e2e-') as td:
     root=Path(td); record=root/'recordings'; record.mkdir(); bin_dir=root/'bin'; bin_dir.mkdir()
     engine=bin_dir/'yt-dlp'; engine.write_text(FIXTURE); engine.chmod(0o755)
+    # Deliberately unavailable secondary; keep this test on the primary path.
+    secondary=bin_dir/'streamlink';secondary.write_text('#!/bin/sh\nexit 1\n');secondary.chmod(0o755)
     env={**os.environ,'RECORDINGS_DIR':str(record),'FIXTURE_ROOT':str(root),'STREAMREC_HARDENED':'1','STREAMREC_EGRESS_PROXY':'http://fixture.invalid:3128','STATIC_DIR':'/app','PATH':str(bin_dir)+':'+os.environ['PATH']}
     log=(root/'server.log').open('w+')
     command=[sys.executable,'-c','import main,uvicorn;main.SAMPLE_INTERVAL=2;main.get_size_poll_interval=lambda:1;uvicorn.run(main.app,host="127.0.0.1",port=18765,log_level="warning")']
@@ -64,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix='streamrec-e2e-') as td:
         start()
         req('/api/channels',401,auth=False)
         token=req('/api/account',method='POST',body={'username':'fixture','password':password,'confirm_password':password},auth=False)['token']
-        assert req('/api/version')['version']=='2.5.1'
+        assert req('/api/version')['version']=='2.5.2'
         assert {a['platform'] for a in req('/api/platform-accounts')}=={'tiktok','bigo'}
         pair=req('/api/platform-accounts/tiktok/pair',method='POST')['code']
         fixture=[{'domain':'.tiktok.com','name':'fixture_cookie','value':'fixture-value','path':'/','secure':True,'hostOnly':False,'httpOnly':True},{'domain':'.bigo.tv','name':'unrelated','value':'not-for-tiktok','path':'/'}]

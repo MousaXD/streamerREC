@@ -74,7 +74,7 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 _static_dir = os.environ.get("STATIC_DIR", str(Path(__file__).parent))
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "2.5.1"
+VERSION = "2.5.2"
 START_TIME = time.time()
 
 # ── Login rate limiting ───────────────────────────────────────────────────────
@@ -1159,6 +1159,21 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
                 _save_state()
                 return
             capture_engine = result.get("capture_engine") or "yt-dlp"
+        # A successful yt-dlp metadata lookup does not guarantee its second
+        # lookup at capture time will work. Prefer the independently available
+        # Streamlink video path, while keeping yt-dlp for viewer sampling.
+        if capture_engine == "yt-dlp":
+            alternate = await _probe_tiktok_streamlink(url, ch.get("proxy") or settings.get("proxy", ""), cookie_path)
+            if alternate:
+                capture_engine = "streamlink"
+                _remember_capture_engine(ch, alternate)
+        if rec.get("stopping") or channels.get(rec["channel_id"]) is not ch or ch.get("recording_id") != rec_id:
+            rec["status"] = "completed"
+            rec["ended_at"] = time.time()
+            if ch.get("recording_id") == rec_id:
+                ch["recording_id"] = None
+            _save_state()
+            return
     rec["capture_engine"] = capture_engine
     if platform == "bigo":
         bigo_proxy = _effective_proxy(ch.get("proxy") or settings.get("proxy", ""))

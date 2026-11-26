@@ -59,11 +59,12 @@ assert args[args.index('--http-proxy')+1]=='http://egress:3128'
 out=args[args.index('--output')+1]; assert out.endswith('.flv')
 raise SystemExit(subprocess.call(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i','color=c=black:s=64x64:r=5','-t','3','-c:v','libx264','-threads','1','-f','flv',out]))
 ''');exe.chmod(0o755)
-            ch={'id':'testch','url':URL,'platform':'TikTok','display_name':'Fixture','recording_id':'testrec','capture_engine':'streamlink','engine_checked_at':time.time(),'monitoring':False}
+            ch={'id':'testch','url':URL,'platform':'TikTok','display_name':'Fixture','recording_id':'testrec','capture_engine':'yt-dlp','engine_checked_at':time.time(),'monitoring':False}
             rec={'id':'testrec','channel_id':'testch','url':URL,'platform':'TikTok','quality':'best','format':'mp4','status':'starting','created_at':time.time(),'bytes':0,'log':[],'viewer_samples':[]}
-            with patch.object(main,'channels',{'testch':ch}),patch.object(main,'recordings',{'testrec':rec}),patch.object(main,'RECORDINGS_DIR',recordings_dir),patch.object(main,'HARDENED',True),patch.object(main,'EGRESS_PROXY','http://egress:3128'),patch.dict(main.settings,{'auto_retry':False,'auto_convert_mp4':False,'webhook_url':''}),patch.dict(os.environ,{'PATH':str(bin_dir)+':'+os.environ['PATH']}),patch('main._save_state'):
+            with patch.object(main,'channels',{'testch':ch}),patch.object(main,'recordings',{'testrec':rec}),patch.object(main,'RECORDINGS_DIR',recordings_dir),patch.object(main,'HARDENED',True),patch.object(main,'EGRESS_PROXY','http://egress:3128'),patch.dict(main.settings,{'auto_retry':False,'auto_convert_mp4':False,'webhook_url':''}),patch.dict(os.environ,{'PATH':str(bin_dir)+':'+os.environ['PATH']}),patch('main._save_state'),patch('main._probe_tiktok_streamlink',AsyncMock(return_value={'is_live':True,'capture_engine':'streamlink'})) as choose:
                 await main._run_recording('testrec')
                 self.assertEqual(rec['status'],'completed',rec.get('log'))
+                choose.assert_awaited_once()
                 self.assertEqual(rec['capture_engine'],'streamlink')
                 self.assertTrue(rec['filepath'].endswith('.mp4'))
                 self.assertTrue(Path(rec['filepath']).stat().st_size>0)
