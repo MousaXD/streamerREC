@@ -5,6 +5,7 @@ from unittest.mock import patch
 from bigo import (
     BIGO_API,
     BigoError,
+    BigoLoginRequired,
     _curl_base,
     _evp_bytes_to_key,
     _fetch_bigo_info_sync,
@@ -94,6 +95,60 @@ class BigoTransportTests(unittest.TestCase):
         self.assertIn("1.2", cmd)
         self.assertNotIn("-L", cmd)
         self.assertNotIn("--location", cmd)
+        self.assertGreaterEqual(int(cmd[cmd.index("--connect-timeout") + 1]), 20)
+
+    @patch("bigo._resolve_site_id_sync", return_value="m4xibby")
+    @patch("bigo._mint_bigo_token_sync", return_value="fresh-token")
+    @patch("bigo._fetch_studio_payload")
+    def test_login_required_placeholder_is_not_offline(self, fetch, mint, _resolve):
+        # Observed BIGO response for a real account without a session.
+        fetch.return_value = {"code": 0, "data": {
+            "siteId": "", "clientBigoId": "m4xibby", "uid": 123,
+            "alive": 0, "roomId": "0", "roomStatus": 0,
+            "needLogin": True, "hls_src": "",
+        }}
+        with self.assertRaises(BigoLoginRequired):
+            _fetch_bigo_info_sync("https://www.bigo.tv/m4xibby")
+        mint.assert_called_once_with(proxy="")
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_args.kwargs["token"], "fresh-token")
+
+    @patch("bigo._resolve_site_id_sync", return_value="m4xibby")
+    @patch("bigo._mint_bigo_token_sync", return_value="fresh-token")
+    @patch("bigo._fetch_studio_payload")
+    def test_untokenized_false_offline_recovers_public_live(self, fetch, mint, _resolve):
+        fetch.side_effect = [
+            {"code": 0, "data": {"alive": 0, "roomId": "0", "siteId": "", "needLogin": True, "hls_src": ""}},
+            {"code": 0, "data": {"alive": 1, "roomId": "123", "siteId": "m4xibby", "needLogin": False, "hls_src": "https://cdn.invalid/live.m3u8"}},
+        ]
+        result = _fetch_bigo_info_sync("https://www.bigo.tv/m4xibby")
+        self.assertTrue(result.alive)
+        self.assertEqual(result.room_id, "123")
+        self.assertEqual(result.hls_src, "https://cdn.invalid/live.m3u8")
+        mint.assert_called_once_with(proxy="")
+        self.assertEqual(fetch.call_args.kwargs["token"], "fresh-token")
+
+    @patch("bigo._resolve_site_id_sync", return_value="J8023")
+    @patch("bigo._fetch_studio_payload")
+    def test_missing_status_is_not_offline(self, fetch, _resolve):
+        for data in (None, {}, {"clientBigoId": "J8023"}, {"alive": "unknown"}):
+            with self.subTest(data=data):
+                fetch.return_value = {"code": 0, "data": data}
+                with self.assertRaises(BigoError):
+                    _fetch_bigo_info_sync("https://www.bigo.tv/J8023")
+
+    @patch("bigo._resolve_site_id_sync", return_value="J8023")
+    @patch("bigo._mint_bigo_token_sync", return_value="token")
+    @patch("bigo._fetch_studio_payload")
+    def test_live_without_room_id_still_attempts_normal_token_flow(self, fetch, mint, _resolve):
+        fetch.side_effect = [
+            {"code": 0, "data": {"alive": 1, "hls_src": ""}},
+            {"code": 0, "data": {"alive": 1, "roomId": "123", "hls_src": "https://cdn.invalid/live.m3u8"}},
+        ]
+        info = _fetch_bigo_info_sync("https://www.bigo.tv/J8023")
+        self.assertTrue(info.alive)
+        self.assertEqual(info.room_id, "123")
+        mint.assert_called_once_with(proxy="")
 
     @patch("bigo._resolve_site_id_sync", return_value="J8023")
     @patch("bigo._run_curl")

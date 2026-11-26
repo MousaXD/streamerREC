@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from bigo import BigoError, fetch_bigo_info, is_bigo_url
+from bigo import BigoError, BigoLoginRequired, fetch_bigo_info, is_bigo_url
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -464,6 +464,12 @@ def _yt_dlp_options(proxy: str = "", cookie_path: str = "") -> list[str]:
     return args
 
 
+def _bigo_check_message(exc: Exception) -> str:
+    if isinstance(exc, BigoLoginRequired):
+        return "BIGO requires a signed-in session to verify this room. Connect your BIGO account in Settings → Platform Accounts."
+    return "BIGO could not verify a playable live stream. Automatic checks will continue."
+
+
 async def _bigo_info(url: str, proxy: str, cookie_path: str = "") -> dict:
     if cookie_path:
         return await fetch_bigo_info(url, proxy=proxy, cookies_file=cookie_path)
@@ -793,6 +799,8 @@ async def _fetch_metadata(url: str, proxy: str, cookie_path: str) -> dict:
     if is_bigo_url(url):
         try:
             info = await _bigo_info(url, proxy or settings.get("proxy", ""), cookie_path)
+            if info.get("alive") and not info.get("hls_src"):
+                raise BigoError("BIGO live room returned no HLS stream")
             return {
                 "display_name": info.get("display_name") or url_username,
                 "username": info.get("site_id") or url_username,
@@ -812,8 +820,11 @@ async def _fetch_metadata(url: str, proxy: str, cookie_path: str) -> dict:
                     "thumbnail": "",
                     "stream_title": "",
                     "_lookup_error": True,
+                    "live_check_status": "unknown",
+                    "live_check_message": _bigo_check_message(e),
                 }
-            return {"_lookup_error": True}
+            return {"_lookup_error": True, "live_check_status": "unknown",
+                    "live_check_message": _bigo_check_message(e)}
 
     proc = None
     try:
@@ -973,6 +984,8 @@ async def probe_live(url: str, proxy: str = "", cookies_file: str = "", *, allow
     with _cookie_snapshot(url, cookies_file) as cookie_path:
         if is_bigo_url(url):
             info = await _bigo_info(url, proxy, cookie_path)
+            if info.get("alive") and not info.get("hls_src"):
+                raise BigoError("BIGO live room returned no HLS stream")
             live = bool(info.get("alive") and info.get("hls_src"))
             return {"is_live": live, "viewer_count": viewer_count(info.get("concurrent_view_count")) if live else None, "observed_at": time.time()}
         if not HARDENED and re.search(r"chaturbate\.com", url, re.I):
@@ -1176,28 +1189,53 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
             return
     rec["capture_engine"] = capture_engine
     if platform == "bigo":
+        rec["capture_engine"] = "bigo"
         bigo_proxy = _effective_proxy(ch.get("proxy") or settings.get("proxy", ""))
+        status, message = "unknown", None
         try:
             bigo_info = await _bigo_info(url, bigo_proxy, cookie_path)
             source_url = bigo_info.get("hls_src") or ""
-            if not bigo_info.get("alive") or not source_url:
-                raise BigoError("BIGO channel is offline or returned no HLS stream")
-            if bigo_info.get("display_name"):
-                ch["display_name"] = bigo_info["display_name"]
-            if bigo_info.get("site_id"):
-                ch["username"] = bigo_info["site_id"]
-            if bigo_info.get("stream_title"):
-                rec["stream_title"] = bigo_info["stream_title"]
-                ch["stream_title"] = bigo_info["stream_title"]
+            if not bigo_info.get("alive"):
+                status, message = "offline", "BIGO reports the channel is currently offline."
+            elif not source_url:
+                raise BigoError("BIGO live room returned no HLS stream")
+            else:
+                status = "live"
         except Exception as e:
+            message = _bigo_check_message(e)
+            logger.warning("BIGO recording startup could not verify room %s: %s", rec["channel_id"], type(e).__name__)
+
+        # The lookup can take several seconds. A stop, deletion or new recording
+        # during that await must not be overwritten by this old startup task.
+        if rec.get("stopping") or channels.get(rec["channel_id"]) is not ch or ch.get("recording_id") != rec_id:
+            rec["status"] = "completed"
+            rec["ended_at"] = time.time()
+            if ch.get("recording_id") == rec_id:
+                ch["recording_id"] = None
+            _save_state()
+            return
+        ch["last_checked"] = time.time()
+        ch["live_check_status"] = status
+        ch["live_check_message"] = message if status == "unknown" else None
+        if status != "unknown":
+            ch["is_live"] = status == "live"
+        if status != "live":
             rec["status"] = "error"
             rec["ended_at"] = time.time()
-            rec["log"] = [f"[StreamRec] BIGO startup failed: {e}"]
-            if (ch_id := rec.get("channel_id")) and ch_id in channels:
-                channels[ch_id]["recording_id"] = None
+            rec["live_check_status"] = status
+            rec["error"] = message
+            rec["log"] = [f"[StreamRec] {message}"]
+            ch["recording_id"] = None
+            _set_channel_viewers(ch, None, time.time())
             _save_state()
-            logger.warning("BIGO recording startup failed for %s: %s", url, e)
             return
+        if bigo_info.get("display_name"):
+            ch["display_name"] = bigo_info["display_name"]
+        if bigo_info.get("site_id"):
+            ch["username"] = bigo_info["site_id"]
+        if bigo_info.get("stream_title"):
+            rec["stream_title"] = bigo_info["stream_title"]
+            ch["stream_title"] = bigo_info["stream_title"]
 
     username     = ch.get("display_name") or ch.get("username") or rec_id
     safe_plat    = re.sub(r'[^\w\-]', '_', platform_raw)
@@ -1894,7 +1932,7 @@ async def _check_one_channel(ch_id: str) -> None:
         logger.warning("Live check failed for %s: %s", ch_id, type(e).__name__)
         if channels.get(ch_id) is ch and not ch.get("recording_id"):
             ch["live_check_status"] = "unknown"
-            ch["live_check_message"] = "Live check could not complete. Automatic checks will continue."
+            ch["live_check_message"] = _bigo_check_message(e) if is_bigo_url(ch["url"]) else "Live check could not complete. Automatic checks will continue."
             ch["last_checked"] = time.time()
             _set_channel_viewers(ch, None, time.time())
         return

@@ -45,6 +45,10 @@ class BigoError(RuntimeError):
     """Raised when a BIGO URL cannot be resolved or queried safely."""
 
 
+class BigoLoginRequired(BigoError):
+    """BIGO withheld the room data pending an authenticated session."""
+
+
 def decrypt_web_protection_prefix(packets: bytearray, seed: int) -> None:
     """Decrypt BIGO's protected bytes in the first two MPEG-TS packets in-place.
 
@@ -194,9 +198,9 @@ def _curl_base(proxy: str = "") -> list[str]:
         "--tls-max",
         "1.2",
         "--connect-timeout",
-        "10",
-        "--max-time",
         "20",
+        "--max-time",
+        "30",
         "-A",
         _USER_AGENT,
     ]
@@ -216,7 +220,7 @@ def _run_curl(cmd: list[str]) -> str:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=25,
+            timeout=35,
             check=False,
         )
     except FileNotFoundError as exc:
@@ -443,35 +447,44 @@ def _fetch_bigo_info_sync(url: str, proxy: str = "") -> BigoInfo:
     site_id = _resolve_site_id_sync(url, proxy=proxy)
     payload = _fetch_studio_payload(site_id, proxy=proxy)
 
-    data = payload.get("data") or {}
-    if not isinstance(data, dict):
-        raise BigoError("BIGO response is missing room data")
+    def parse_room(result):
+        data = result.get("data")
+        if not isinstance(data, dict) or not data:
+            raise BigoError("BIGO response is missing room data")
+        alive_raw = data.get("alive")
+        if alive_raw not in (0, "0", False, 1, "1", True):
+            raise BigoError("BIGO did not provide a valid room status")
+        alive = alive_raw in (1, "1", True)
+        source = data.get("hls_src") or ""
+        if not isinstance(source, str):
+            raise BigoError("BIGO returned an invalid HLS URL")
+        source = source.strip()
+        return data, alive, str(data.get("roomId") or ""), source
 
-    alive_raw = data.get("alive")
-    alive = alive_raw in (1, "1", True)
-    room_id = str(data.get("roomId") or data.get("clientBigoId") or "")
-    hls_src = str(data.get("hls_src") or "").strip()
+    data, alive, room_id, hls_src = parse_room(payload)
 
-    # Since August 2026, BIGO can report a live room while withholding hls_src
-    # until the caller supplies a fresh one-use integrity token. Retry once
-    # with a token instead of falsely treating that response as offline.
-    if alive and room_id not in ("", "0") and not hls_src:
+    def needs_login(data):
+        return data.get("needLogin") in (True, 1, "1", "true")
+
+    # BIGO's normal public web request includes a one-use integrity token.
+    # The legacy request without it may report alive=0, roomId=0, needLogin
+    # and an empty HLS URL even while a public broadcast is actually live.
+    # Resolve that placeholder through the normal tokenized request once.
+    # If the tokenized response still requires login, honor that requirement.
+    if not hls_src and (alive or needs_login(data)):
         token = _mint_bigo_token_sync(proxy=proxy)
         payload = _fetch_studio_payload(site_id, proxy=proxy, token=token)
-        data = payload.get("data") or {}
-        if not isinstance(data, dict):
-            raise BigoError("BIGO tokenized response is missing room data")
-        alive_raw = data.get("alive")
-        alive = alive_raw in (1, "1", True)
-        room_id = str(data.get("roomId") or data.get("clientBigoId") or "")
-        hls_src = str(data.get("hls_src") or "").strip()
+        data, alive, room_id, hls_src = parse_room(payload)
+
+    if not hls_src and needs_login(data):
+        raise BigoLoginRequired("BIGO requires a signed-in session to verify this room. Connect your BIGO account in Settings.")
 
     if hls_src:
         parsed_hls = urlparse(hls_src)
         if parsed_hls.scheme not in ("http", "https") or not parsed_hls.hostname:
             raise BigoError("BIGO returned an invalid HLS URL")
 
-    if alive and room_id not in ("", "0") and not hls_src:
+    if alive and not hls_src:
         raise BigoError("BIGO reports a live room but withheld the HLS stream URL")
 
     # Accept only explicitly named concurrent counts, not cumulative views,

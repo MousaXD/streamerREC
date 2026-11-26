@@ -2,10 +2,44 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import main
-from bigo import BigoError
+from bigo import BigoError, BigoLoginRequired
 
 
 class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_login_required_metadata_is_unknown_and_actionable(self):
+        with patch('main.fetch_bigo_info', AsyncMock(side_effect=BigoLoginRequired('login'))):
+            info = await main.fetch_metadata('https://www.bigo.tv/m4xibby')
+        self.assertTrue(info['_lookup_error'])
+        self.assertEqual(info['live_check_status'], 'unknown')
+        self.assertIn('Connect your BIGO account', info['live_check_message'])
+
+    async def test_record_startup_distinguishes_offline_and_login_required(self):
+        url = 'https://www.bigo.tv/m4xibby'
+        for answer, expected in [({'alive': False, 'hls_src': ''}, 'offline'), (BigoLoginRequired('login'), 'unknown'), ({'alive': True, 'hls_src': ''}, 'unknown')]:
+            with self.subTest(expected=expected, answer=answer):
+                ch = {'id': 'channel', 'url': url, 'platform': 'Bigo', 'recording_id': 'rec', 'is_live': True, 'monitoring': True}
+                rec = {'id': 'rec', 'channel_id': 'channel', 'url': url, 'platform': 'Bigo', 'status': 'starting'}
+                fetch = AsyncMock(side_effect=answer) if isinstance(answer, Exception) else AsyncMock(return_value=answer)
+                with patch.object(main, 'channels', {'channel': ch}), patch.object(main, 'recordings', {'rec': rec}), patch('main._bigo_info', fetch), patch('main._save_state'), patch('main.asyncio.create_subprocess_exec', AsyncMock()) as spawn:
+                    await main._run_recording('rec')
+                    spawn.assert_not_awaited()
+                self.assertEqual(rec['status'], 'error')
+                self.assertEqual(ch['live_check_status'], expected)
+                self.assertEqual(rec['live_check_status'], expected)
+                self.assertEqual(ch['is_live'], expected == 'unknown')
+                self.assertIsNone(ch['recording_id'])
+                self.assertTrue(ch['monitoring'])
+                self.assertEqual(rec['capture_engine'], 'bigo')
+
+    async def test_monitor_retains_login_required_message(self):
+        ch = {'id': 'channel', 'url': 'https://www.bigo.tv/m4xibby', 'is_live': True, 'monitoring': True}
+        with patch.object(main, 'channels', {'channel': ch}), patch.object(main, 'recordings', {}), patch('main.probe_live', AsyncMock(side_effect=BigoLoginRequired('login'))), patch('main._start_recording_for_channel', AsyncMock()) as start:
+            await main._check_one_channel('channel')
+            start.assert_not_awaited()
+        self.assertEqual(ch['live_check_status'], 'unknown')
+        self.assertIn('Connect your BIGO account', ch['live_check_message'])
+        self.assertTrue(ch['is_live'])
+
     async def test_bigo_protocol_error_propagates_from_live_check(self):
         with patch(
             "main.fetch_bigo_info",
