@@ -53,6 +53,10 @@ class BigoTransportError(BigoError):
     """A transient network or TLS failure while contacting BIGO."""
 
 
+class BigoVerificationError(BigoError):
+    """The public-web verification service rejected or withheld a token."""
+
+
 def decrypt_web_protection_prefix(packets: bytearray, seed: int) -> None:
     """Decrypt BIGO's protected bytes in the first two MPEG-TS packets in-place.
 
@@ -336,10 +340,10 @@ def _mint_bigo_token_sync(proxy: str = "") -> str:
     time_payload = _parse_jsonp(_run_curl(_curl_base(proxy) + common_headers + [time_url]))
     code = time_payload.get("code")
     if code not in (None, 0, "0"):
-        raise BigoError(f"BIGO integrity time request failed: code={code}")
+        raise BigoVerificationError(f"BIGO integrity time request failed: code={code}")
     at_time = time_payload.get("time")
     if at_time is None:
-        raise BigoError("BIGO integrity time response is missing time")
+        raise BigoVerificationError("BIGO integrity time response is missing time")
 
     fingerprint = _build_bigo_fingerprint(str(at_time))
     plaintext = json.dumps(fingerprint, separators=(",", ":"), ensure_ascii=False)
@@ -360,7 +364,7 @@ def _mint_bigo_token_sync(proxy: str = "") -> str:
             if isinstance(token, str) and token:
                 return token
 
-    raise BigoError(f"BIGO integrity token mint failed: code={last_payload.get('code')}")
+    raise BigoVerificationError(f"BIGO integrity token mint failed: code={last_payload.get('code')}")
 
 
 def _fetch_studio_payload(site_id: str, proxy: str = "", token: str = "") -> dict[str, Any]:

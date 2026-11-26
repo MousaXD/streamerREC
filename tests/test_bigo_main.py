@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import main
-from bigo import BigoError, BigoLoginRequired
+from bigo import BigoError, BigoLoginRequired, BigoVerificationError, decrypt_web_protection_prefix
 
 
 class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -41,6 +41,12 @@ class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(main._usable_bigo_resolution(resolved, url, '', ''))
 
     async def test_real_bigo_hls_capture_remux_with_fresh_resolution(self):
+        await self._assert_real_bigo_hls_capture(protected=False)
+
+    async def test_real_bigo_web_protected_fixture_capture(self):
+        await self._assert_real_bigo_hls_capture(protected=True)
+
+    async def _assert_real_bigo_hls_capture(self, *, protected):
         # Real native BIGO subprocess, HLS network reader, MPEG-TS media,
         # and ffmpeg remux. The local playlist is a synthetic test fixture.
         url = 'https://www.bigo.tv/fixture'
@@ -58,6 +64,16 @@ class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 '-t', '3', '-c:v', 'libx264', '-threads', '1', '-g', '10',
                 '-hls_time', '1', '-hls_list_size', '0', '-f', 'hls', str(media / 'fixture.m3u8')],
                 check=True, timeout=15)
+            if protected:
+                # Synthetic segments for exercising the existing BIGO parser.
+                # The same XOR routine is reversible on this local fixture.
+                seed = 2239971888
+                for segment in media.glob('*.ts'):
+                    content = bytearray(segment.read_bytes())
+                    decrypt_web_protection_prefix(content, seed)
+                    segment.write_bytes(content)
+                playlist = media / 'fixture.m3u8'
+                playlist.write_text(playlist.read_text().replace('#EXTINF:', f'#EXT-X-BIGO-WEB-PROTECTION:VERSION=1,SEED={seed}\n#EXTINF:', 1))
             server = ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(QuietHandler, directory=str(media)))
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -88,6 +104,13 @@ class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(info['_lookup_error'])
         self.assertEqual(info['live_check_status'], 'unknown')
         self.assertIn('Connect your BIGO account', info['live_check_message'])
+
+    async def test_verification_rejection_is_not_mislabeled_as_offline(self):
+        with patch('main.fetch_bigo_info', AsyncMock(side_effect=BigoVerificationError('BIGO token rejected'))):
+            info = await main.fetch_metadata('https://www.bigo.tv/m4xibby')
+        self.assertTrue(info['_lookup_error'])
+        self.assertEqual(info['live_check_status'], 'unknown')
+        self.assertIn('rejected public playback verification', info['live_check_message'])
 
     async def test_record_startup_distinguishes_offline_and_login_required(self):
         url = 'https://www.bigo.tv/m4xibby'
