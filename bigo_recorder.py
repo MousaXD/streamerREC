@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from http.cookiejar import MozillaCookieJar
+import re
 import ssl
 import sys
 import time
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from bigo import BIGO_USER_AGENT, BigoError, decrypt_web_protection_prefix
 from streamlink import Streamlink
+from streamlink.exceptions import StreamError
 from streamlink.session.http import SSLContextAdapter
 from streamlink.stream.hls import (
     HLSSegment,
@@ -29,6 +31,7 @@ from streamlink.stream.hls import (
     M3U8Parser,
     parse_tag,
 )
+from streamlink.stream.hls.m3u8 import HLSPlaylist
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -93,8 +96,19 @@ class BigoHLSSegment(HLSSegment):
     seed: int | None = None
 
 
+class BigoHLSPlaylist(HLSPlaylist):
+    def get_name_pixels(self, with_framerate=None):
+        # Quality labels describe the short edge (e.g. 540x960 is 540p),
+        # not the long edge of a portrait video.
+        resolution = self.stream_info.resolution
+        if resolution and resolution.width and resolution.height:
+            return f"{min(resolution.width, resolution.height)}p"
+        return None
+
+
 class BigoM3U8Parser(M3U8Parser):
     __segment__ = BigoHLSSegment
+    __playlist__ = BigoHLSPlaylist
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -128,7 +142,54 @@ class BigoHLSStream(HLSStream):
     __parser__ = BigoM3U8Parser
 
 
-def record(url: str, output: Path, proxy: str = "", cookies_file: str = "") -> int:
+def _rank_variants(streams: dict, quality: str) -> list[str]:
+    """Rank advertised renditions by short-edge resolution, then bitrate."""
+    def score(name):
+        pixels, _, bitrate = name.partition("|")
+        height_match = re.fullmatch(r"(\d+)p", pixels)
+        bitrate_match = re.match(r"([\d.]+)k", bitrate)
+        return (
+            int(height_match[1]) if height_match else 0,
+            float(bitrate_match[1]) if bitrate_match else 0,
+        )
+
+    ranked = sorted(streams, key=score, reverse=True)
+    if quality == "worst":
+        return list(reversed(ranked))
+    cap = re.fullmatch(r"(\d+)p?", quality)
+    if cap:
+        allowed = [name for name in ranked if 0 < score(name)[0] <= int(cap[1])]
+        if allowed:
+            return allowed
+        known = [name for name in ranked if score(name)[0]]
+        if known:
+            return list(reversed(known))
+    return ranked
+
+
+def _open_stream(session: Streamlink, url: str, quality: str):
+    # Use Streamlink's master-playlist implementation, including external
+    # audio handling. Keep our BIGO parser for the actual media segments.
+    variants = BigoHLSStream.parse_variant_playlist(
+        session, url, name_fmt="{pixels}|{bitrate}",
+    )
+    if not variants:
+        print("[BIGO] Single source supplied; no selectable quality renditions", flush=True)
+        return BigoHLSStream(session, url).open()
+    error = None
+    for selected in _rank_variants(variants, quality):
+        try:
+            reader = variants[selected].open()
+        except (StreamError, OSError) as exc:
+            error = exc
+            print(f"[BIGO] Advertised rendition {selected} unavailable; trying next", flush=True)
+            continue
+        print(f"[BIGO] Selected advertised rendition {selected} ({len(variants)} available)", flush=True)
+        return reader
+    raise BigoError("No advertised BIGO rendition could be opened") from error
+
+
+def record(url: str, output: Path, proxy: str = "", cookies_file: str = "", quality: str = "best") -> int:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BigoError("BIGO media URL must be a valid HTTP or HTTPS URL")
@@ -161,8 +222,7 @@ def record(url: str, output: Path, proxy: str = "", cookies_file: str = "") -> i
     if proxy:
         session.set_option("http-proxy", proxy)
 
-    stream = BigoHLSStream(session, url)
-    reader = stream.open()
+    reader = _open_stream(session, url, quality)
 
     total = 0
     last_report = time.monotonic()
@@ -195,10 +255,11 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--proxy", default="")
     parser.add_argument("--cookies-file", default="")
+    parser.add_argument("--quality", default="best")
     args = parser.parse_args()
 
     try:
-        return record(args.url, Path(args.output), args.proxy, args.cookies_file)
+        return record(args.url, Path(args.output), args.proxy, args.cookies_file, args.quality)
     except Exception as exc:
         print(f"[BIGO] recorder error: {exc}", file=sys.stderr, flush=True)
         return 1

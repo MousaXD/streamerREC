@@ -46,7 +46,13 @@ class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_bigo_web_protected_fixture_capture(self):
         await self._assert_real_bigo_hls_capture(protected=True)
 
-    async def _assert_real_bigo_hls_capture(self, *, protected):
+    async def test_real_bigo_master_uses_highest_portrait_resolution(self):
+        await self._assert_real_bigo_hls_capture(protected=False, master=True, quality="best", expected_size=(720, 1280))
+
+    async def test_real_bigo_master_respects_quality_cap(self):
+        await self._assert_real_bigo_hls_capture(protected=False, master=True, quality="480p", expected_size=(360, 640))
+
+    async def _assert_real_bigo_hls_capture(self, *, protected, master=False, quality="best", expected_size=(64, 64)):
         # Real native BIGO subprocess, HLS network reader, MPEG-TS media,
         # and ffmpeg remux. The local playlist is a synthetic test fixture.
         url = 'https://www.bigo.tv/fixture'
@@ -59,11 +65,18 @@ class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             media.mkdir()
             output = root / 'recordings'
             output.mkdir()
-            subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error',
-                '-f', 'lavfi', '-i', 'color=c=blue:s=64x64:r=10',
-                '-t', '3', '-c:v', 'libx264', '-threads', '1', '-g', '10',
-                '-hls_time', '1', '-hls_list_size', '0', '-f', 'hls', str(media / 'fixture.m3u8')],
-                check=True, timeout=15)
+            variants = [('low', '360x640'), ('high', '720x1280')] if master else [('fixture', '64x64')]
+            for name, size in variants:
+                subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                    '-f', 'lavfi', '-i', f'color=c=blue:s={size}:r=10',
+                    '-t', '3', '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-g', '10',
+                    '-hls_time', '1', '-hls_list_size', '0', '-f', 'hls', str(media / f'{name}.m3u8')],
+                    check=True, timeout=15)
+            if master:
+                (media / 'fixture.m3u8').write_text(
+                    '#EXTM3U\n'
+                    '#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=360x640\nlow.m3u8\n'
+                    '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=720x1280\nhigh.m3u8\n')
             if protected:
                 # Synthetic segments for exercising the existing BIGO parser.
                 # The same XOR routine is reversible on this local fixture.
@@ -81,7 +94,7 @@ class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 source = f'http://127.0.0.1:{server.server_port}/fixture.m3u8'
                 resolved = main._bigo_resolution(url, '', '', {'alive': True, 'hls_src': source, 'site_id': 'fixture'})
                 ch = {'id': 'channel', 'url': url, 'platform': 'Bigo', 'display_name': 'Fixture', 'recording_id': 'rec', 'monitoring': False}
-                rec = {'id': 'rec', 'channel_id': 'channel', 'url': url, 'platform': 'Bigo', 'quality': 'best', 'format': 'mp4', 'status': 'starting', 'created_at': time.time(), 'bytes': 0, 'log': [], 'viewer_samples': []}
+                rec = {'id': 'rec', 'channel_id': 'channel', 'url': url, 'platform': 'Bigo', 'quality': quality, 'format': 'mp4', 'status': 'starting', 'created_at': time.time(), 'bytes': 0, 'log': [], 'viewer_samples': []}
                 with patch.object(main, 'channels', {'channel': ch}), patch.object(main, 'recordings', {'rec': rec}), patch.object(main, 'RECORDINGS_DIR', output), patch.object(main, 'HARDENED', False), patch.dict(main.settings, {'proxy': '', 'auto_retry': False, 'auto_convert_mp4': False, 'webhook_url': ''}), patch('main._save_state'), patch('main._bigo_info', AsyncMock(side_effect=AssertionError('Duplicate lookup'))) as lookup:
                     await main._run_recording('rec', bigo_resolution=resolved)
                     lookup.assert_not_awaited()
@@ -89,8 +102,8 @@ class BigoMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(rec['filepath'].endswith('.mp4'))
                 self.assertGreater(Path(rec['filepath']).stat().st_size, 0)
                 self.assertAlmostEqual(rec['duration_seconds'], 3, places=1)
-                result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name', '-of', 'json', rec['filepath']], check=True, capture_output=True, timeout=15)
-                self.assertIn({'codec_name': 'h264', 'codec_type': 'video'}, json.loads(result.stdout)['streams'])
+                result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name,width,height', '-of', 'json', rec['filepath']], check=True, capture_output=True, timeout=15)
+                self.assertIn({'codec_name': 'h264', 'codec_type': 'video', 'width': expected_size[0], 'height': expected_size[1]}, json.loads(result.stdout)['streams'])
                 self.assertNotIn(source, json.dumps(rec))
                 self.assertIsNone(ch['recording_id'])
             finally:

@@ -1409,6 +1409,7 @@ async def _run_recording(rec_id: str, cookie_path: str = "", *, bigo_resolution:
             str(Path(__file__).with_name("bigo_recorder.py")),
             "--url", source_url,
             "--output", str(bigo_output),
+            "--quality", quality,
         ]
         if proxy:
             cmd += ["--proxy", proxy]

@@ -6,7 +6,10 @@ from bigo_recorder import (
     BigoM3U8Parser,
     TLS12Adapter,
     _ProtectedResponse,
+    _rank_variants,
+    _open_stream,
 )
+from unittest.mock import Mock, patch
 
 
 class DummyResponse:
@@ -18,6 +21,22 @@ class DummyResponse:
 
 
 class BigoRecorderTests(unittest.TestCase):
+    def test_quality_ranking_prefers_resolution_then_bitrate(self):
+        streams = dict.fromkeys(("360p|500k", "720p|2000k", "720p|3000k", "1080p|4000k", "540p|1000k"))
+        self.assertEqual(_rank_variants(streams, "best")[0], "1080p|4000k")
+        self.assertEqual(_rank_variants(streams, "720p")[:2], ["720p|3000k", "720p|2000k"])
+        self.assertEqual(_rank_variants(streams, "480p"), ["360p|500k"])
+        self.assertEqual(_rank_variants(streams, "worst")[0], "360p|500k")
+        self.assertEqual(_rank_variants({"None|500k": None, "None|1000k": None}, "best")[0], "None|1000k")
+
+    def test_unavailable_highest_rendition_tries_next(self):
+        high, low = Mock(), Mock()
+        high.open.side_effect = OSError("unavailable")
+        with patch("bigo_recorder.BigoHLSStream.parse_variant_playlist", return_value={"720p|2000k": high, "540p|1000k": low}):
+            self.assertIs(_open_stream(Mock(), "https://cdn.example.invalid/master.m3u8", "best"), low.open.return_value)
+        high.open.assert_called_once()
+        low.open.assert_called_once()
+
     def test_tls_adapter_caps_media_at_tls12(self):
         context = TLS12Adapter().get_ssl_context()
         self.assertEqual(context.maximum_version, ssl.TLSVersion.TLSv1_2)
