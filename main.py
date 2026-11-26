@@ -73,7 +73,7 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 _static_dir = os.environ.get("STATIC_DIR", str(Path(__file__).parent))
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 START_TIME = time.time()
 
 # ── Login rate limiting ───────────────────────────────────────────────────────
@@ -659,7 +659,7 @@ PLATFORM_MAP = [
     (r"bilibili\.com",           "Bilibili"),
     (r"douyin\.com",             "Douyin"),
     (r"afreecatv\.com",          "Afreeca"),
-    (r"sooplive\.co",            "Sooplive"),
+    (r"sooplive\.co(?:\.kr)?",            "Sooplive"),
     (r"naver\.com",              "Naver"),
     (r"weibo\.com",              "Weibo"),
     (r"huya\.com",               "Huya"),
@@ -673,7 +673,7 @@ PLATFORM_MAP = [
     (r"rumble\.com",             "Rumble"),
     (r"stripchat\.com",          "Stripchat"),
     (r"twitcasting\.tv",         "Twitcasting"),
-    (r"pandalive\.co",           "Pandalive"),
+    (r"pandalive\.co(?:\.kr)?",           "Pandalive"),
     (r"bigo\.tv|bigovideo\.tv", "Bigo"),
     (r"chaturbate\.com",         "Chaturbate"),
     (r"cam4\.com",               "Cam4"),
@@ -686,8 +686,12 @@ PLATFORM_MAP = [
 ]
 
 def detect_platform(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or "").rstrip(".")
+    except ValueError:
+        return "Unknown"
     for pattern, name in PLATFORM_MAP:
-        if re.search(pattern, url, re.I):
+        if re.search(r"(?:^|\.)(?:" + pattern + r")$", host, re.I):
             return name
     return "Unknown"
 
@@ -2765,6 +2769,7 @@ async def version():
         "pi_mode": _is_pi(),
         "poll_interval": get_frontend_poll_hint(),
         "hardened": HARDENED,
+        "egress_policy": "public-web" if HARDENED else "compatibility",
     }
 
 

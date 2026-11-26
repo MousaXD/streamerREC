@@ -1,9 +1,0 @@
-.tiktok.com
-.tiktokcdn.com
-.tiktokcdn-us.com
-.tiktokcdn-eu.com
-.tiktokv.com
-.bigo.tv
-.bigo.sg
-.bigovideo.tv
-.bigolive.tv

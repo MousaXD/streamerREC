@@ -14,8 +14,16 @@ class DestinationPolicyTests(unittest.TestCase):
         for host in ('www.tiktok.com', 'pull-hls-f16-tt01.tiktokcdn.com', 'www.bigo.tv', 'slink.bigovideo.tv'):
             self.assertTrue(allowed_host(host), host)
 
-    def test_unapproved_hosts_and_ports(self):
-        for url in ('https://example.com', 'https://tiktok.com.evil.example/@abc/live', 'https://127.0.0.1/', 'https://169.254.169.254/', 'https://www.tiktok.com:8443/@abc/live', 'https://user:password@www.tiktok.com/@abc/live', 'file:///etc/passwd'):
+    def test_public_web_hosts_and_cdns_are_allowed(self):
+        for url in ('https://example.com/live', 'https://www.youtube.com/@creator/live', 'https://cdn.new-provider.net/stream.m3u8', 'https://1.1.1.1/', 'https://[2606:4700:4700::1111]/'):
+            with self.subTest(url=url):
+                self.assertEqual(approved_url(url), url)
+        self.assertEqual(main.detect_platform('https://tiktok.com.evil.example/@abc/live'), 'Unknown')
+        self.assertEqual(main.detect_platform('https://example.com/tiktok.com'), 'Unknown')
+        self.assertEqual(main.detect_platform('https://www.tiktok.com/@abc/live'), 'TikTok')
+
+    def test_private_hosts_and_unsafe_urls_are_denied(self):
+        for url in ('https://127.0.0.1/', 'https://169.254.169.254/', 'http://10.0.0.1/', 'http://100.64.0.1/', 'http://172.21.0.1/', 'http://192.168.1.1/', 'http://224.0.0.1/', 'http://[::1]/', 'http://[::ffff:127.0.0.1]/', 'http://[fc00::1]/', 'http://[fe80::1]/', 'http://[2001:db8::1]/', 'http://127.1/', 'http://2130706433/', 'http://0x7f.0.0.1/', 'http://router.lan/', 'http://egress/', 'http://localhost./', 'https://www.tiktok.com:8443/@abc/live', 'https://user:password@www.tiktok.com/@abc/live', 'file:///etc/passwd', 'ftp://example.com/', 'http://example.com/\\bad', 'http://example.com/\nfoo'):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 approved_url(url)
 

@@ -291,6 +291,7 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
         </div>
         <div class="sgroup" id="pane-network" style="display:none">
           <h3>Connection</h3>
+          <p class="helptext" id="egressNotice" style="margin-bottom:12px" hidden>Public internet access is enabled through the isolated HTTP/HTTPS proxy. Private and local network destinations remain blocked. No domain whitelist.</p>
           <div class="sbox">
             <div class="srow"><div class="lbl"><b>Global Proxy</b><span>HTTP/SOCKS5 proxy for all recordings</span></div><input class="tin" id="in-proxy" placeholder="socks5://…" style="width:200px"></div>
             <div class="srow"><div class="lbl"><b>Extra yt-dlp Flags</b><span>Custom CLI arguments</span></div><input class="tin" id="in-extra" placeholder="--no-playlist" style="width:200px"></div>
@@ -373,9 +374,9 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
 <div class="ov" id="addOv" onclick="if(event.target===this)closeAdd()">
   <div class="modal">
     <h2>Add Channel</h2>
-    <div class="fg"><label for="addPlatform">Platform</label><select id="addPlatform" onchange="updateAddFields()"><option value="tiktok">TikTok Live</option><option value="bigo">BIGO Live</option><option value="custom">Custom approved live URL</option></select></div>
+    <div class="fg"><label for="addPlatform">Platform</label><select id="addPlatform" onchange="updateAddFields()"><option value="tiktok">TikTok Live</option><option value="bigo">BIGO Live</option><option value="custom">Other platform / live URL</option></select></div>
     <div class="fg" id="addHandleRow"><label for="addHandle" id="addHandleLabel">Username</label><input id="addHandle" placeholder="@username" oninput="updateAddFields()" autocomplete="off" spellcheck="false"><div id="addUrlPreview" class="url-preview">https://www.tiktok.com/@username/live</div></div>
-    <div class="fg" id="addUrlRow" style="display:none"><label for="addUrl">Approved live URL</label><input id="addUrl" placeholder="https://www.bigo.tv/…"></div>
+    <div class="fg" id="addUrlRow" style="display:none"><label for="addUrl">Public live URL</label><input id="addUrl" placeholder="https://www.bigo.tv/…"></div>
     <p class="helptext">Live broadcasts only. <button type="button" class="viewer-peak" style="color:var(--blue);text-decoration:underline" onclick="closeAdd();openConnectedAccounts()">Connect a platform account</button> if a stream requires sign-in.</p>
     <div class="mrow">
       <div class="fg"><label>Quality</label><select id="addQ"><option value="">Default</option><option value="best">Best</option><option value="1080p">1080p</option><option value="720p">720p</option><option value="480p">480p</option></select></div>
@@ -550,7 +551,7 @@ function openAdd(){updateAddFields();$('addOv').classList.add('open');setTimeout
 function closeAdd(){$('addOv').classList.remove('open');$('addUrl').value='';$('addHandle').value='';updateAddFields()}
 async function doAdd(){
   const platform=$('addPlatform').value,handle=$('addHandle').value.trim(),url=$('addUrl').value.trim();
-  if(platform==='custom'?!url:!handle){toast('Enter the channel username or approved URL',true);return}
+  if(platform==='custom'?!url:!handle){toast('Enter the channel username or public live URL',true);return}
   const target=platform==='custom'?{url}:{platform,handle};
   $('addBtn').disabled=true;
   try{
@@ -766,7 +767,7 @@ function startPoll(){if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval
 },5000)}
 
 /* init */
-(async()=>{try{hardened=!!(await api('/api/version')).hardened}catch{}$('guestBtn').hidden=hardened;await Promise.allSettled([fetchChannels(),loadAcc(),fetchSlots()]);startPoll()})();
+(async()=>{try{const v=await api('/api/version');hardened=!!v.hardened;$('egressNotice').hidden=v.egress_policy!=='public-web'}catch{}$('guestBtn').hidden=hardened;await Promise.allSettled([fetchChannels(),loadAcc(),fetchSlots()]);startPoll()})();
 </script>
 </body>
 </html>

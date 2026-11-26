@@ -1,7 +1,6 @@
 FROM python:3.12.16-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b
 RUN apt-get update && apt-get install -y --no-install-recommends squid && rm -rf /var/lib/apt/lists/*
 COPY squid.conf /etc/squid/squid.conf
-COPY egress-domains.txt /etc/squid/egress-domains.txt
 USER proxy
 RUN squid -k parse -f /etc/squid/squid.conf
 ENTRYPOINT ["squid", "-N", "-f", "/etc/squid/squid.conf"]
