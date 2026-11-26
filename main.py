@@ -74,7 +74,7 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 _static_dir = os.environ.get("STATIC_DIR", str(Path(__file__).parent))
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "2.5.2"
+VERSION = "2.5.3"
 START_TIME = time.time()
 
 # ── Login rate limiting ───────────────────────────────────────────────────────

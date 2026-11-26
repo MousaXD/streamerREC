@@ -66,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix='streamrec-e2e-') as td:
         start()
         req('/api/channels',401,auth=False)
         token=req('/api/account',method='POST',body={'username':'fixture','password':password,'confirm_password':password},auth=False)['token']
-        assert req('/api/version')['version']=='2.5.2'
+        assert req('/api/version')['version']=='2.5.3'
         assert {a['platform'] for a in req('/api/platform-accounts')}=={'tiktok','bigo'}
         pair=req('/api/platform-accounts/tiktok/pair',method='POST')['code']
         fixture=[{'domain':'.tiktok.com','name':'fixture_cookie','value':'fixture-value','path':'/','secure':True,'hostOnly':False,'httpOnly':True},{'domain':'.bigo.tv','name':'unrelated','value':'not-for-tiktok','path':'/'}]
