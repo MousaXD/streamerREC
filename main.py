@@ -26,7 +26,8 @@ from urllib.parse import urlparse
 from bigo import BigoError, fetch_bigo_info, is_bigo_url
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from network_policy import approved_url
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -42,6 +43,10 @@ logger = logging.getLogger("streamrec")
 # ── Platform detection ────────────────────────────────────────────────────────
 IS_WINDOWS = _platform.system() == "Windows"
 PI_MODE = os.environ.get("STREAMREC_PI_MODE", "0") == "1"
+HARDENED = os.environ.get("STREAMREC_HARDENED", "0") == "1"
+EGRESS_PROXY = os.environ.get("STREAMREC_EGRESS_PROXY", "")
+if HARDENED and not EGRESS_PROXY:
+    raise RuntimeError("Hardened mode requires the isolated egress proxy")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # Docker sets RECORDINGS_DIR=/recordings  |  bare metal falls back to ~/StreamRec/recordings
@@ -124,7 +129,10 @@ async def _supervised_monitor():
             logger.exception("monitor_loop crashed: %s — restarting in 10s", e)
             await asyncio.sleep(10)
 
-app = FastAPI(title="StreamRec API", version=VERSION, lifespan=lifespan)
+app = FastAPI(title="StreamRec API", version=VERSION, lifespan=lifespan,
+              docs_url=None if HARDENED else "/docs",
+              redoc_url=None if HARDENED else "/redoc",
+              openapi_url=None if HARDENED else "/openapi.json")
 
 
 def _sweep_orphan_recorders() -> int:
@@ -229,25 +237,39 @@ def _client_origin_ok(request: Request) -> bool:
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if path.startswith("/api/") and not _is_auth_exempt(request.method, path):
-            if _load_account():
-                if not _client_origin_ok(request):
-                    return JSONResponse(
-                        {"detail": "Cross-origin request rejected"}, status_code=403,
-                    )
-                token = request.cookies.get("streamrec_session")
-                if not token:
-                    auth_header = request.headers.get("authorization", "")
-                    if auth_header.lower().startswith("bearer "):
-                        token = auth_header[7:].strip()
-                if not _is_valid_session(token):
-                    return JSONResponse(
-                        {"detail": "Authentication required"}, status_code=401,
-                    )
-        return await call_next(request)
+        method = request.method
+        if path.startswith("/api/"):
+            if HARDENED and method not in ("GET", "HEAD", "OPTIONS"):
+                origin = request.headers.get("origin") or request.headers.get("referer")
+                if (origin and urlparse(origin).netloc != request.url.netloc) or request.headers.get("sec-fetch-site") == "cross-site":
+                    return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
+            if not _is_auth_exempt(method, path):
+                acc = _load_account()
+                setup = path == "/api/account" and method == "POST" and not ACCOUNT_FILE.exists()
+                if acc or (HARDENED and not setup):
+                    if not _client_origin_ok(request):
+                        return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
+                    token = request.cookies.get("streamrec_session")
+                    if not token:
+                        auth_header = request.headers.get("authorization", "")
+                        if auth_header.lower().startswith("bearer "):
+                            token = auth_header[7:].strip()
+                    if not acc or not _is_valid_session(token):
+                        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        response = await call_next(request)
+        if HARDENED:
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+            if path.startswith("/api/"):
+                response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 app.add_middleware(AuthMiddleware)
+if HARDENED:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
 
 _proc_semaphore = asyncio.Semaphore(3 if PI_MODE else 6)
@@ -349,6 +371,68 @@ settings: dict = {
 }
 
 # ── Cross-platform process helpers ────────────────────────────────────────────
+
+def _effective_proxy(proxy: str = "") -> str:
+    return EGRESS_PROXY if HARDENED else proxy
+
+
+def _media_path(name: str) -> Path:
+    if not name:
+        raise ValueError("Missing media path")
+    path = Path(name).resolve()
+    root = RECORDINGS_DIR.resolve()
+    if not path.is_relative_to(root) or path == root:
+        raise ValueError("Path is outside recordings")
+    if path.relative_to(root).parts[0] in {"cookies", "avatars"}:
+        raise ValueError("Not a recording")
+    if path.suffix.lower() not in {".mp4", ".mkv", ".ts", ".mp3", ".flv", ".webm", ".m4a", ".aac", ".mov", ".ogg", ".opus", ".wav", ".m4v"}:
+        raise ValueError("Not a media file")
+    return path
+
+
+def _cookie_path(name: str) -> Optional[Path]:
+    if not name:
+        return None
+    if Path(name).name != name or name in (".", "..") or not name.lower().endswith(".txt"):
+        raise ValueError("Invalid cookies filename")
+    path = COOKIES_DIR / name
+    if path.is_symlink() or not path.resolve().is_relative_to(COOKIES_DIR.resolve()):
+        raise ValueError("Invalid cookies path")
+    return path
+
+
+def _cookie_args(name: str = "") -> list[str]:
+    path = _cookie_path(name or settings.get("cookies_file", ""))
+    return ["--cookies", str(path)] if path and path.is_file() else []
+
+
+def _yt_dlp_options(proxy: str = "", cookies_file: str = "") -> list[str]:
+    args = ["--ignore-config", "--no-plugin-dirs"]
+    if proxy := _effective_proxy(proxy):
+        args += ["--proxy", proxy]
+    return args + _cookie_args(cookies_file)
+
+
+def _validate_hardened_options(values: dict) -> None:
+    if HARDENED:
+        for field in ("proxy", "extra_args", "webhook_url"):
+            if values.get(field):
+                raise HTTPException(400, f"{field} is disabled in hardened mode")
+    if values.get("cookies_file"):
+        try:
+            _cookie_path(values["cookies_file"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+
+def _approved_channel_url(url: str) -> str:
+    if not HARDENED:
+        return url
+    try:
+        return approved_url(url)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
 
 def _subprocess_kwargs() -> dict:
     """
@@ -470,15 +554,30 @@ def _load_state():
                 ch["display_name"] = _username_from_url(ch["url"])
             if not ch.get("username") and ch.get("url"):
                 ch["username"] = _username_from_url(ch["url"])
+            if HARDENED:
+                ch["proxy"] = ch["extra_args"] = ""
+                try:
+                    ch["url"] = approved_url(ch["url"])
+                except (ValueError, KeyError, TypeError):
+                    ch["monitoring"] = False
             channels[cid] = ch
         for k, v in data.get("settings", {}).items():
             if k in settings:
                 settings[k] = v
+        if HARDENED:
+            for key in ("proxy", "extra_args", "webhook_url"):
+                settings[key] = ""
         for rid, rec in data.get("recordings", {}).items():
             # Strip any in-progress state fields that no longer apply
             rec.pop("pid", None)
             rec.pop("stopping", None)
             rec.pop("speed", None)
+            if HARDENED and rec.get("filepath"):
+                try:
+                    _media_path(rec["filepath"])
+                except (ValueError, OSError, TypeError):
+                    rec["filepath"] = None
+                    logger.warning("Ignored invalid media path in recording index")
             recordings[rid] = rec
     except Exception as e:
         logger.warning("Failed to load state: %s", e)
@@ -543,9 +642,10 @@ def _username_from_url(url: str) -> str:
     return ""
 
 
-async def fetch_metadata(url: str, proxy: str = "") -> dict:
+async def fetch_metadata(url: str, proxy: str = "", cookies_file: str = "") -> dict:
     # Always extract a fallback username from the URL itself
     url_username = _username_from_url(url)
+    proxy = _effective_proxy(proxy or settings.get("proxy", ""))
 
     if is_bigo_url(url):
         try:
@@ -575,7 +675,8 @@ async def fetch_metadata(url: str, proxy: str = "") -> dict:
         async with _proc_semaphore:
             proc = await asyncio.create_subprocess_exec(
                 "yt-dlp", "--dump-single-json", "--no-download",
-                "--playlist-items", "1", "--socket-timeout", "15", url,
+                "--playlist-items", "1", "--socket-timeout", "15",
+                *_yt_dlp_options(proxy, cookies_file), "--", url,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -598,7 +699,7 @@ async def fetch_metadata(url: str, proxy: str = "") -> dict:
             if "avatar" in tid or "profile" in tid:
                 avatar = t.get("url", "")
                 break
-        if not avatar:
+        if not avatar and not HARDENED:
             avatar = await _try_scrape_avatar(url)
 
         # Prefer yt-dlp data, fall back to URL-parsed username
@@ -693,7 +794,8 @@ async def _check_chaturbate_live(url: str, proxy: str = "") -> Optional[bool]:
         return None
 
 
-async def check_is_live(url: str, proxy: str = "") -> bool:
+async def check_is_live(url: str, proxy: str = "", cookies_file: str = "") -> bool:
+    proxy = _effective_proxy(proxy)
     if is_bigo_url(url):
         # BIGO extraction/protocol errors are not equivalent to "offline".
         # Let the per-channel monitor catch them so it preserves the previous
@@ -707,22 +809,20 @@ async def check_is_live(url: str, proxy: str = "") -> bool:
         if result is not None:
             return result
 
-    cmd = ["yt-dlp", "--simulate", "--no-warnings",
-           "--socket-timeout", "20", "--playlist-items", "1"]
-    if proxy:
-        cmd += ["--proxy", proxy]
-    cmd.append(url)
+    cmd = ["yt-dlp", "--dump-single-json", "--skip-download", "--no-warnings",
+           "--socket-timeout", "20", "--playlist-items", "1",
+           *_yt_dlp_options(proxy, cookies_file), "--", url]
     proc = None
     try:
         # Hold the semaphore across the full wait so the process cap is real.
         async with _proc_semaphore:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             try:
-                await asyncio.wait_for(proc.wait(), timeout=35)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=35)
             except asyncio.TimeoutError:
                 _kill_proc(proc.pid, force=True)
                 try:
@@ -730,7 +830,10 @@ async def check_is_live(url: str, proxy: str = "") -> bool:
                 except asyncio.TimeoutError:
                     pass
                 return False
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            return False
+        data = json.loads(stdout)
+        return data.get("is_live") is True or data.get("live_status") == "is_live"
     except Exception as e:
         logger.debug("check_is_live error for %s: %s", url, e)
         if proc and proc.returncode is None:
@@ -772,17 +875,37 @@ async def _start_recording_for_channel(ch_id: str) -> Optional[str]:
 
 
 async def run_recording(rec_id: str):
+    try:
+        await _run_recording(rec_id)
+    except Exception as exc:
+        rec = recordings.get(rec_id)
+        if rec is None:
+            return
+        rec["status"] = "error"
+        rec["ended_at"] = time.time()
+        rec["error"] = str(exc)
+        rec.setdefault("log", []).append(f"[StreamRec] Recording failed: {exc}")
+        ch = channels.get(rec.get("channel_id"), {})
+        if ch.get("recording_id") == rec_id:
+            ch["recording_id"] = None
+        _save_state()
+        logger.exception("Recording %s failed before cleanup", rec_id)
+
+
+async def _run_recording(rec_id: str):
     rec = recordings[rec_id]
     ch  = channels.get(rec["channel_id"], {})
     quality      = rec.get("quality") or settings["default_quality"]
     fmt          = rec.get("format")  or settings["default_format"]
     url          = rec["url"]
+    if HARDENED:
+        url = approved_url(url)
     platform_raw = rec.get("platform") or "Unknown"
     platform     = platform_raw.lower()
 
     source_url = url
     if platform == "bigo":
-        bigo_proxy = ch.get("proxy") or settings.get("proxy", "")
+        bigo_proxy = _effective_proxy(ch.get("proxy") or settings.get("proxy", ""))
         try:
             bigo_info = await fetch_bigo_info(url, proxy=bigo_proxy)
             source_url = bigo_info.get("hls_src") or ""
@@ -847,7 +970,7 @@ async def run_recording(rec_id: str):
         # User specified explicit quality (1080p, 720p, etc.) for non-cam platforms
         effective_quality = quality
 
-    cmd = ["yt-dlp", "--no-part"]
+    cmd = ["yt-dlp", "--no-part", "--ignore-config", "--no-plugin-dirs"]
     if platform not in _no_live_from_start:
         cmd += ["--live-from-start", "--hls-use-mpegts"]
 
@@ -881,16 +1004,12 @@ async def run_recording(rec_id: str):
         cmd += ["--postprocessor-args", "ffmpeg:-c:v copy -c:a aac -af adelay=1000|1000"]
 
     # Proxy (channel > global)
-    proxy = ch.get("proxy") or settings.get("proxy", "")
+    proxy = _effective_proxy(ch.get("proxy") or settings.get("proxy", ""))
     if proxy:
         cmd += ["--proxy", proxy]
 
-    # Cookies file (channel > global)
-    cf_name = ch.get("cookies_file") or settings.get("cookies_file", "")
-    if cf_name:
-        cf = Path(cf_name) if Path(cf_name).is_absolute() else COOKIES_DIR / cf_name
-        if cf.exists():
-            cmd += ["--cookies", str(cf)]
+    # Only a file uploaded into the dedicated cookie directory is accepted.
+    cmd += _cookie_args(ch.get("cookies_file", ""))
 
     # Username / password for age-restricted sites
     ch_user = ch.get("ch_username", "")
@@ -902,6 +1021,8 @@ async def run_recording(rec_id: str):
 
     # Extra yt-dlp args (channel > global) — hardened against injection
     extra = ch.get("extra_args") or settings.get("extra_args", "")
+    if extra and HARDENED:
+        raise ValueError("Custom downloader arguments are disabled in hardened mode")
     if extra:
         try:
             parts = shlex.split(extra, posix=not IS_WINDOWS)
@@ -945,7 +1066,7 @@ async def run_recording(rec_id: str):
         if proxy:
             cmd += ["--proxy", proxy]
     else:
-        cmd += ["-o", str(output_path), source_url]
+        cmd += ["-o", str(output_path), "--", source_url]
 
     rec["status"]     = "recording"
     rec["started_at"] = time.time()
@@ -1169,7 +1290,7 @@ async def run_recording(rec_id: str):
                     )
                     await asyncio.wait_for(remux_proc.wait(), timeout=REMUX_TIMEOUT)
                 if remux_proc.returncode == 0 and Path(target_path).exists():
-                    Path(fp).unlink(missing_ok=True)
+                    (_media_path(fp) if HARDENED else Path(fp)).unlink(missing_ok=True)
                     rec["filepath"] = target_path
                     rec["filename"] = Path(target_path).name
                     rec["bytes"] = Path(target_path).stat().st_size
@@ -1232,7 +1353,7 @@ async def run_recording(rec_id: str):
                     await asyncio.wait_for(conv.wait(), timeout=REMUX_TIMEOUT)
                 if conv.returncode == 0:
                     if delete_orig:
-                        Path(fp).unlink(missing_ok=True)
+                        (_media_path(fp) if HARDENED else Path(fp)).unlink(missing_ok=True)
                     rec["filepath"] = mp4_path
                     rec["filename"] = Path(mp4_path).name
                     try:
@@ -1313,7 +1434,7 @@ async def run_recording(rec_id: str):
 async def _send_webhook(event: str, payload: dict):
     """Send a JSON POST to the configured webhook URL (with native Discord embeds if Discord)."""
     url = settings.get("webhook_url", "").strip()
-    if not url:
+    if HARDENED or not url:
         return
     # SSRF guard: only http(s), never internal hosts (webhook URL is set by
     # the admin, but validate anyway since it auto-fires on every recording).
@@ -1405,7 +1526,7 @@ def _prune_channel_recordings(ch_id: str):
         if kept > max_s:
             if fp := r.get("filepath"):
                 try:
-                    Path(fp).unlink(missing_ok=True)
+                    (_media_path(fp) if HARDENED else Path(fp)).unlink(missing_ok=True)
                 except Exception:
                     pass
             recordings.pop(rid, None)
@@ -1429,7 +1550,7 @@ async def _run_retention_cleanup():
             continue
         if fp := rec.get("filepath"):
             try:
-                Path(fp).unlink(missing_ok=True)
+                (_media_path(fp) if HARDENED else Path(fp)).unlink(missing_ok=True)
             except Exception:
                 pass
         recordings.pop(rec_id, None)
@@ -1459,7 +1580,9 @@ async def _check_one_channel(ch_id: str) -> None:
 
     proxy = ch.get("proxy") or settings.get("proxy", "")
     try:
-        is_live = await check_is_live(ch["url"], proxy=proxy)
+        if HARDENED:
+            approved_url(ch["url"])
+        is_live = await check_is_live(ch["url"], proxy=proxy, cookies_file=ch.get("cookies_file", ""))
     except Exception as e:
         logger.warning("Live check failed for %s (%s): %s", ch_id, ch.get("url"), e)
         return
@@ -1598,6 +1721,8 @@ def _stop_rec(rec: dict, force: bool = False):
 
 @app.post("/api/channels")
 async def add_channel(req: AddChannelRequest):
+    req.url = _approved_channel_url(req.url)
+    _validate_hardened_options(req.model_dump())
     # Validate URL — must be http/https to prevent SSRF
     parsed = urlparse(req.url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -1616,16 +1741,17 @@ async def add_channel(req: AddChannelRequest):
     # Resolve domain names to verify target IPs are not internal / private.
     # getaddrinfo is blocking — run it in a worker thread so the event loop
     # doesn't stall on slow/unresponsive DNS servers.
-    try:
-        resolved_addrs = await asyncio.get_running_loop().getaddrinfo(hostname, None)
-        for family, _, _, _, sockaddr in resolved_addrs:
-            ip_str = sockaddr[0]
-            addr = ipaddress.ip_address(ip_str)
-            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
-                raise HTTPException(400, f"URL rejected: host resolves to private/internal IP ({ip_str})")
-    except socket.gaierror:
-        # DNS resolution failure will be rejected early
-        raise HTTPException(400, "URL rejected: unable to resolve host")
+    if not HARDENED:
+        try:
+            resolved_addrs = await asyncio.get_running_loop().getaddrinfo(hostname, None)
+            for family, _, _, _, sockaddr in resolved_addrs:
+                ip_str = sockaddr[0]
+                addr = ipaddress.ip_address(ip_str)
+                if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
+                    raise HTTPException(400, f"URL rejected: host resolves to private/internal IP ({ip_str})")
+        except socket.gaierror:
+            # DNS resolution failure will be rejected early
+            raise HTTPException(400, "URL rejected: unable to resolve host")
     ch_id    = str(uuid.uuid4())[:8]
     platform = detect_platform(req.url)
     ch = {
@@ -1650,7 +1776,7 @@ async def add_channel(req: AddChannelRequest):
     channels[ch_id] = ch
 
     async def _fetch_and_record():
-        meta = await fetch_metadata(req.url, proxy=req.proxy)
+        meta = await fetch_metadata(req.url, proxy=req.proxy, cookies_file=req.cookies_file)
         if meta and ch_id in channels:
             channels[ch_id].update({
                 "display_name": meta.get("display_name", ""),
@@ -1706,6 +1832,7 @@ async def list_channels():
 async def update_channel(ch_id: str, req: UpdateChannelRequest):
     if ch_id not in channels:
         raise HTTPException(404, "Not found")
+    _validate_hardened_options(req.model_dump(exclude_none=True))
     for field, val in req.model_dump(exclude_none=True).items():
         # username/password map to ch_username/ch_password to avoid clash with metadata field
         if field == "username":
@@ -1778,7 +1905,10 @@ async def refresh_channel(ch_id: str):
     if ch.get("platform") == "Unknown" or not ch.get("platform"):
         channels[ch_id]["platform"] = detect_platform(ch["url"])
     proxy = ch.get("proxy") or settings.get("proxy", "")
-    meta = await fetch_metadata(ch["url"], proxy=proxy)
+    if ch.get("cookies_file"):
+        meta = await fetch_metadata(ch["url"], proxy=proxy, cookies_file=ch["cookies_file"])
+    else:
+        meta = await fetch_metadata(ch["url"], proxy=proxy)
     if meta:
         updates = {
             "display_name": meta.get("display_name") or ch.get("display_name") or "",
@@ -1896,6 +2026,11 @@ async def download_recording(rec_id: str):
     if not rec:
         raise HTTPException(404, "Not found")
     fp = rec.get("filepath")
+    if HARDENED and fp:
+        try:
+            fp = str(_media_path(fp))
+        except (ValueError, OSError, TypeError):
+            raise HTTPException(404, "File not found")
     if not fp or not Path(fp).exists():
         raise HTTPException(404, "File not found")
     return FileResponse(fp, filename=rec.get("filename", f"{rec_id}.mp4"))
@@ -1923,9 +2058,10 @@ async def delete_recording(rec_id: str):
     recordings.pop(rec_id, None)
     if fp := rec.get("filepath"):
         try:
-            Path(fp).unlink(missing_ok=True)
+            (_media_path(fp) if HARDENED else Path(fp)).unlink(missing_ok=True)
         except Exception:
             pass
+    _save_state()
     return {"ok": True}
 
 
@@ -1937,9 +2073,18 @@ async def archive_recording(rec_id: str):
     if rec.get("status") not in ("completed", "error"):
         raise HTTPException(400, "Only completed recordings can be archived")
     fp = rec.get("filepath")
+    if HARDENED and fp:
+        try:
+            fp = str(_media_path(fp))
+        except (ValueError, OSError, TypeError):
+            raise HTTPException(404, "File not found")
     if fp and Path(fp).exists():
         try:
             dest = ARCHIVE_DIR / Path(fp).name
+            if HARDENED:
+                _media_path(str(dest))
+                if dest.exists():
+                    raise FileExistsError("Destination already exists")
             shutil.move(fp, str(dest))
             rec["filepath"] = str(dest)
             rec["filename"] = dest.name
@@ -1958,6 +2103,11 @@ async def restore_recording(rec_id: str):
     if rec.get("status") != "archived":
         raise HTTPException(400, "Only archived recordings can be restored")
     fp = rec.get("filepath")
+    if HARDENED and fp:
+        try:
+            fp = str(_media_path(fp))
+        except (ValueError, OSError, TypeError):
+            raise HTTPException(404, "File not found")
     if fp and Path(fp).exists():
         try:
             ch_id = rec.get("channel_id")
@@ -1969,6 +2119,10 @@ async def restore_recording(rec_id: str):
             rec_dir = RECORDINGS_DIR / safe_plat / safe_user
             rec_dir.mkdir(parents=True, exist_ok=True)
             dest = rec_dir / Path(fp).name
+            if HARDENED:
+                _media_path(str(dest))
+                if dest.exists():
+                    raise FileExistsError("Destination already exists")
             shutil.move(fp, str(dest))
             rec["filepath"] = str(dest)
             rec["filename"] = dest.name
@@ -1985,6 +2139,11 @@ async def preview_recording(rec_id: str, request: Request):
     if not rec:
         raise HTTPException(404, "Not found")
     fp = rec.get("filepath")
+    if HARDENED and fp:
+        try:
+            fp = str(_media_path(fp))
+        except (ValueError, OSError, TypeError):
+            raise HTTPException(404, "File not found")
     if not fp or not Path(fp).exists():
         raise HTTPException(404, "File not found")
     file_path = Path(fp)
@@ -2062,6 +2221,11 @@ async def cut_recording(rec_id: str, req: CutRecordingRequest):
     if not rec:
         raise HTTPException(404, "Not found")
     fp = rec.get("filepath")
+    if HARDENED and fp:
+        try:
+            fp = str(_media_path(fp))
+        except (ValueError, OSError, TypeError):
+            raise HTTPException(404, "File not found")
     if not fp or not Path(fp).exists():
         raise HTTPException(404, "Source file not found")
     if req.start_time < 0 or req.end_time <= req.start_time:
@@ -2138,6 +2302,7 @@ async def get_settings():
 
 @app.patch("/api/settings")
 async def update_settings(req: UpdateSettingsRequest):
+    _validate_hardened_options(req.model_dump(exclude_none=True))
     for field, val in req.model_dump(exclude_none=True).items():
         settings[field] = val
     _save_state()
@@ -2146,6 +2311,8 @@ async def update_settings(req: UpdateSettingsRequest):
 
 @app.post("/api/settings/test-webhook")
 async def test_webhook():
+    if HARDENED:
+        raise HTTPException(403, "Webhooks are disabled in hardened mode")
     url = settings.get("webhook_url", "").strip()
     if not url:
         raise HTTPException(400, "No webhook URL configured in settings")
@@ -2177,8 +2344,15 @@ async def upload_cookies(file: UploadFile = File(...)):
             413, f"File too large — max {MAX_COOKIES_SIZE // 1024} KiB"
         )
     safe_name = re.sub(r'[^\w\-\.]', '_', file.filename or "cookies.txt")
-    dest      = COOKIES_DIR / safe_name
+    try:
+        dest = _cookie_path(safe_name)
+        if dest is None:
+            raise ValueError("Invalid filename")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     dest.write_bytes(content)
+    if not IS_WINDOWS:
+        os.chmod(dest, 0o600)
     return {"ok": True, "filename": safe_name, "size": len(content)}
 
 
@@ -2194,8 +2368,11 @@ async def list_cookies():
 @app.delete("/api/cookies/{filename}")
 async def delete_cookies(filename: str):
     safe = re.sub(r'[^\w\-\.]', '_', filename)
-    dest = COOKIES_DIR / safe
-    if not dest.exists():
+    try:
+        dest = _cookie_path(safe)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not dest or not dest.exists():
         raise HTTPException(404, "Not found")
     dest.unlink()
     return {"ok": True}
@@ -2263,6 +2440,7 @@ async def version():
         "version": VERSION,
         "pi_mode": _is_pi(),
         "poll_interval": get_frontend_poll_hint(),
+        "hardened": HARDENED,
     }
 
 
@@ -2303,6 +2481,16 @@ async def export_config():
 @app.post("/api/import")
 async def import_config(req: ImportRequest):
     imported = 0
+    _validate_hardened_options(req.settings)
+    for cid, ch in req.channels.items():
+        if not re.fullmatch(r"[a-f0-9]{8}", cid):
+            raise HTTPException(400, "Invalid imported channel ID")
+        if not isinstance(ch, dict) or not isinstance(ch.get("url"), str):
+            raise HTTPException(400, "Invalid imported channel")
+        ch["url"] = _approved_channel_url(ch["url"])
+        ch["id"] = cid
+        ch["platform"] = detect_platform(ch["url"])
+        _validate_hardened_options(ch)
     # Known safe channel keys — reject anything else to prevent state corruption
     _SAFE_CH_KEYS = {
         "id", "url", "platform", "quality", "format", "monitoring",
@@ -2418,6 +2606,8 @@ def require_auth(request: Request) -> bool:
     """If an account exists, ensure the request has a valid session token (via cookie or header)."""
     acc = _load_account()
     if not acc:
+        if HARDENED:
+            raise HTTPException(401, "Authentication required")
         return True  # Guest / unconfigured mode
     token = request.cookies.get("streamrec_session")
     if not token:
@@ -2443,6 +2633,8 @@ def _save_account(acc: dict) -> None:
     try:
         tmp = ACCOUNT_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(acc, indent=2), encoding="utf-8")
+        if not IS_WINDOWS:
+            os.chmod(tmp, 0o600)
         tmp.replace(ACCOUNT_FILE)
         if not IS_WINDOWS:
             try:
@@ -2451,6 +2643,7 @@ def _save_account(acc: dict) -> None:
                 pass
     except Exception as e:
         logger.warning("Failed to save account: %s", e)
+        raise HTTPException(500, "Account could not be saved") from e
 
 
 def _public_account(acc: dict) -> dict:
@@ -2490,8 +2683,9 @@ def _validate_username(u: str) -> str:
 
 
 def _validate_password(p: str) -> None:
-    if not p or len(p) < 4:
-        raise HTTPException(400, "Password must be at least 4 characters")
+    minimum = 12 if HARDENED else 4
+    if not p or len(p) < minimum:
+        raise HTTPException(400, f"Password must be at least {minimum} characters")
     if len(p) > 256:
         raise HTTPException(400, "Password too long (max 256 characters)")
 
@@ -2506,8 +2700,8 @@ async def get_account():
 
 @app.post("/api/account")
 async def create_account(req: CreateAccountRequest, response: Response):
-    if _load_account():
-        raise HTTPException(400, "An account already exists")
+    if _load_account() or ACCOUNT_FILE.exists():
+        raise HTTPException(400, "An account already exists or requires local recovery")
     username = _validate_username(req.username)
     _validate_password(req.password)
     if req.password != req.confirm_password:
@@ -2557,11 +2751,15 @@ async def update_account(req: UpdateAccountRequest):
         acc["username"] = _validate_username(req.username)
 
     _save_account(acc)
+    if req.new_password is not None:
+        _active_sessions.clear()
     return _public_account(acc)
 
 
 @app.delete("/api/account")
 async def delete_account(response: Response):
+    if HARDENED:
+        raise HTTPException(403, "Account removal is disabled in hardened mode")
     if ACCOUNT_FILE.exists():
         try:
             ACCOUNT_FILE.unlink()
@@ -2710,6 +2908,8 @@ async def get_ytdlp_version():
     except Exception as e:
         logger.warning("Failed to get yt-dlp version: %s", e)
 
+    if HARDENED:
+        return {"current": current, "latest": None, "updates_disabled": True}
     # Get latest version from GitHub
     try:
         result = await asyncio.create_subprocess_exec(
@@ -2731,6 +2931,8 @@ async def get_ytdlp_version():
 @app.post("/api/ytdlp-update")
 async def update_ytdlp():
     """Update yt-dlp to the latest version."""
+    if HARDENED:
+        raise HTTPException(403, "Updates require rebuilding with a verified version and checksum")
     logger.info("Updating yt-dlp...")
 
     try:
@@ -2799,4 +3001,6 @@ async def update_ytdlp():
 
 
 # ── Static files (must be last) ──────────────────────────────────────────────
-app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")
+@app.get("/", include_in_schema=False)
+async def index():
+    return FileResponse(Path(_static_dir) / "index.html", media_type="text/html")

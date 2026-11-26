@@ -29,3 +29,6 @@ wg0.conf
 *~
 .DS_Store
 Thumbs.db
+
+# Public, reviewed proxy configuration (not a VPN secret)
+!squid.conf

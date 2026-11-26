@@ -53,12 +53,16 @@
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/orhogi/streamerREC.git
+git clone https://github.com/MousaXD/streamerREC.git
 cd streamerREC
 docker compose up -d
 ```
 
-Open `http://localhost:8080`. Recordings land in `./recordings`.
+Open `http://127.0.0.1:8080` and create a password-protected account (at least 12 characters). Recordings land in `./recordings`.
+
+The default Compose deployment is hardened: the recorder runs as UID/GID 999 without Linux capabilities, with a read-only root filesystem, a private internal network and a localhost-only published port. A fixed-target unprivileged relay publishes the dashboard on localhost without giving the recorder a route to the internet. A separate unprivileged Squid proxy permits only the streaming domains in `egress-domains.txt`; private addresses, arbitrary ports and other domains are denied. By default TikTok and BIGO are enabled. Other platforms require explicitly reviewing and adding their official API and media CDN domains, then rebuilding both images. External browser thumbnails, webhooks, custom proxies and custom downloader flags are disabled in this mode. HTTPS tunnels are not TLS-inspected; an allowed platform/CDN remains a trusted destination.
+
+For an existing rootless Docker installation, ensure the recording directory is writable by the container's *mapped* UID (not necessarily host UID 999). Inspect the mapping with `docker compose exec streamrec cat /proc/self/uid_map`; grant a narrowly scoped ACL to the mapped UID on `recordings` only, never change ownership or permissions of your entire home directory. Back up `recordings/state.json` and any account file before migrating. A fresh directory can be initialized with the same scoped access. Do not commit recordings, credentials or exported configuration.
 
 ### Manual
 
@@ -66,10 +70,10 @@ Prerequisites: Python 3.12+, [FFmpeg](https://ffmpeg.org/download.html), [yt-dlp
 
 ```bash
 pip install -r requirements.txt
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://localhost:8000`. Recordings default to `~/StreamRec/recordings`.
+Open `http://localhost:8000`. Recordings default to `~/StreamRec/recordings`. The manual deployment is a compatibility mode without Compose network isolation; use hardened Docker for privacy-sensitive use.
 
 ## Configuration
 
@@ -103,24 +107,17 @@ recordings/
 2. Upload the `.txt` in **Settings → Cookies**
 3. Assign it per channel or globally
 
-## VPN / proxy
+## Network policy
 
-An optional WireProxy sidecar exposes your WireGuard tunnel as a SOCKS5 proxy. It is **not** started by default:
-
-```bash
-# place your WireGuard config at ./wg0.conf first
-docker compose --profile vpn up -d
-```
-
-Then set the proxy per channel or globally to `socks5://wireproxy:1080`.
+The hardened Compose deployment does not support user-configurable proxies, extra downloader flags or webhooks. The optional legacy WireProxy Dockerfile is not part of the hardened deployment. The proxy logs destination hostnames and status codes, not stream URLs. Inspect them with `docker compose logs egress`.
 
 ## Authentication
 
-The app runs in open guest mode until you create an account (first-run prompt). Once an account exists, the API requires login. Deleting the account from the account panel returns the app to guest mode.
+Hardened Compose requires an account before API access and prevents reverting to guest mode. Log in again after password changes or server restarts. The localhost binding is intentional; do not publish this service directly to the internet. Manual compatibility mode retains optional guest mode.
 
-## Updating yt-dlp
+## Updating yt-dlp and dependencies
 
-**Settings → System → Update** updates yt-dlp in place (pip, with a binary fallback). Keeping yt-dlp current matters — extractor breakage is the most common recording failure.
+In hardened mode in-place updates are disabled. Update the pinned `YTDLP_VERSION` and independently verified `YTDLP_SHA256` in the Dockerfile, review the release, and rebuild with `docker compose build && docker compose up -d`. The Python dependencies are installed from a version- and SHA-256-locked `requirements.lock` file. Review and regenerate the lock when upgrading packages. The base image is digest-pinned; update its digest deliberately. Build-time package retrieval uses the normal package repositories; runtime egress remains restricted.
 
 ## API
 

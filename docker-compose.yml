@@ -1,58 +1,84 @@
 networks:
-  streamrec:
+  isolated:
+    driver: bridge
+    internal: true
+  outbound:
+    driver: bridge
+  ui_publish:
     driver: bridge
 
-# VPN proxy is OPTIONAL — activate with:  docker compose --profile vpn up -d
-# Place your WireGuard config at ./wg0.conf first (see README).
 services:
-
-  # ── WireProxy (SOCKS5 proxy over WireGuard) ───────────────────────────────────
-  # Turns your wg0.conf into a SOCKS5 proxy at socks5://wireproxy:1080
-  # Only channels that have the proxy field set will use it — everything else
-  # (YouTube, TikTok, Twitch) goes direct. No system-level routing changes.
-  wireproxy:
+  egress:
     build:
       context: .
-      dockerfile: Dockerfile.wireproxy
-    container_name: wireproxy
+      dockerfile: Dockerfile.egress
     restart: unless-stopped
-    profiles: ["vpn"]
-    cap_add:
-      - NET_ADMIN
-    volumes:
-      - ./wg0.conf:/etc/wireproxy/wg0.conf:ro
-    command: -c /etc/wireproxy/wg0.conf
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /run:size=8m,mode=1777
+      - /var/log/squid:size=8m,mode=1777
+      - /var/spool/squid:size=16m,mode=1777
+    networks: [isolated, outbound]
     healthcheck:
-      test: ["CMD", "sh", "-c", "ss -tln | grep -q 1080 || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - streamrec
+      test: [CMD, python, -c, "import socket; socket.create_connection(('127.0.0.1',3128),2).close()"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
 
-  # ── StreamRec ─────────────────────────────────────────────────────────────────
   streamrec:
     build: .
     container_name: streamrec
     restart: unless-stopped
-    ports:
-      - "8080:8080"
+    init: true
     depends_on:
-      wireproxy:
+      egress:
         condition: service_healthy
-        required: false
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=128m,mode=1777
     volumes:
       - ./recordings:/recordings
-    # Uncomment the deploy block below to limit resources (recommended for Raspberry Pi)
-    # deploy:
-    #   resources:
-    #     limits:
-    #       memory: 512M
-    #       cpus: "3.0"
     environment:
-      - RECORDINGS_DIR=/recordings
-      - STATIC_DIR=/app
-      # Uncomment the line below to enable Raspberry Pi / low-power mode
-      # - STREAMREC_PI_MODE=1
-    networks:
-      - streamrec
+      RECORDINGS_DIR: /recordings
+      STATIC_DIR: /app
+      STREAMREC_HARDENED: '1'
+      STREAMREC_EGRESS_PROXY: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+      HTTPS_PROXY: http://egress:3128
+      http_proxy: http://egress:3128
+      https_proxy: http://egress:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      no_proxy: localhost,127.0.0.1,::1
+      XDG_CACHE_HOME: /tmp/cache
+      HOME: /tmp
+    # Embedded DNS still resolves the egress service; no external DNS forwarding.
+    dns: [127.0.0.1]
+    networks: [isolated]
+
+  # Docker cannot publish ports on a container attached only to an internal
+  # network. This fixed-target relay exposes the UI without giving the recorder
+  # an outbound route. It accepts no arbitrary upstream addresses.
+  ingress:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingress
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - '127.0.0.1:8080:8080'
+    depends_on:
+      streamrec:
+        condition: service_healthy
+    networks: [isolated, ui_publish]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health',timeout=3).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

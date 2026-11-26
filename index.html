@@ -397,7 +397,7 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
       <div class="fg"><label>Username</label><input id="acUser"></div>
       <div class="fg"><label>Password</label><input type="password" id="acPass"></div>
       <div class="fg"><label>Confirm</label><input type="password" id="acPass2"></div>
-      <div class="mact"><button class="btn btn-ghost" onclick="closeAcc()">Guest Mode</button><button class="btn btn-acc" onclick="createAcc()">Create</button></div>
+      <div class="mact"><button id="guestBtn" class="btn btn-ghost" onclick="closeAcc()">Guest Mode</button><button class="btn btn-acc" onclick="createAcc()">Create</button></div>
     </div>
     <div id="accLogin" style="display:none;flex-direction:column;gap:14px">
       <div class="fg"><label>Username</label><input id="alUser"></div>
@@ -419,7 +419,7 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
 
 <script>
 const API='';
-let channels={}, recs={}, settings={}, acc={exists:false,authed:false};
+let channels={}, recs={}, settings={}, acc={exists:false,authed:false}, hardened=false;
 let pollTimer=null, logCh=null;
 
 /* helpers */
@@ -569,6 +569,7 @@ async function delRec(id){if(!confirm('Delete this recording and its file?'))ret
 async function loadSettingsUI(){
   try{
     settings=await api('/api/settings');
+    for(const id of ['in-proxy','in-extra','in-webhook']) $(id).disabled=hardened;
     $('sw-pi').classList.toggle('on',!!settings.pi_mode);
     $('in-interval').value=settings.monitor_interval??60;
     $('sw-autoall').classList.toggle('on',!!settings.record_on_add);
@@ -614,7 +615,7 @@ async function upCookies(inp){const f=inp.files[0];if(!f)return;const fd=new For
 async function delCookie(n){try{await api(`/api/cookies/${encodeURIComponent(n)}`,{method:'DELETE'});loadCookies()}catch(e){toast(e.message,true)}}
 
 /* yt-dlp */
-async function fetchYd(){try{const d=await api('/api/ytdlp-version');$('ydVer').textContent='Version: '+d.current+(d.latest===d.current?' (latest)':'')}catch{$('ydVer').textContent='unknown'}}
+async function fetchYd(){try{const d=await api('/api/ytdlp-version');$('ydVer').textContent='Version: '+d.current+(d.updates_disabled?' (verified image; rebuild to update)':d.latest===d.current?' (latest)':'');$('ydBtn').disabled=!!d.updates_disabled}catch{$('ydVer').textContent='unknown'}}
 async function updYd(){const b=$('ydBtn');b.disabled=true;b.textContent='Updating…';try{const d=await api('/api/ytdlp-update',{method:'POST'});toast(d.success?'Updated to '+d.version:'Update failed',!d.success);fetchYd()}catch{toast('Update failed',true)}finally{b.disabled=false;b.textContent='Update'}}
 
 /* backup */
@@ -629,7 +630,7 @@ async function loadAcc(){
   }catch{}
   renderAcc();
   if(acc.exists&&!acc.authed)openAcc();
-  if(!acc.exists&&!localStorage.streamrecGuestSkip)openAcc();
+  if(!acc.exists&&(hardened||!localStorage.streamrecGuestSkip))openAcc();
 }
 function renderAcc(){
   const n=acc.exists&&acc.authed?(acc.username||'User'):'Guest';
@@ -643,10 +644,10 @@ function openAcc(){
   if(acc.exists&&acc.authed){$('profName').textContent=acc.username||'';$('profAv').textContent=(acc.username||'U')[0].toUpperCase();$('profSince').textContent=acc.created_at?'since '+new Date(acc.created_at*1e3).toLocaleDateString():''}
   $('accOv').classList.add('open');
 }
-function closeAcc(){$('accOv').classList.remove('open');localStorage.streamrecGuestSkip='1'}
+function closeAcc(){if(hardened&&!acc.authed)return;$('accOv').classList.remove('open');localStorage.streamrecGuestSkip='1'}
 async function createAcc(){try{await api('/api/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('acUser').value.trim(),password:$('acPass').value,confirm_password:$('acPass2').value})});toast('Account created');await loadAcc();closeAcc()}catch(e){toast(e.message,true)}}
 async function loginAcc(){try{await api('/api/account/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('alUser').value.trim(),password:$('alPass').value})});toast('Logged in');await loadAcc();closeAcc();fetchChannels()}catch(e){toast(e.message,true)}}
-async function saveAcc(){const nw=$('pcNew').value;if(!nw)return toast('Enter new password');try{await api('/api/account',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:$('pcCur').value,new_password:nw,confirm_new_password:nw})});toast('Updated');$('pcCur').value='';$('pcNew').value=''}catch(e){toast(e.message,true)}}
+async function saveAcc(){const nw=$('pcNew').value;if(!nw)return toast('Enter new password');try{await api('/api/account',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:$('pcCur').value,new_password:nw,confirm_new_password:nw})});toast('Updated — sign in again');$('pcCur').value='';$('pcNew').value='';acc.authed=false;channels={};recs={};await loadAcc();openAcc()}catch(e){toast(e.message,true)}}
 async function logoutAcc(){try{await api('/api/account/logout',{method:'POST'})}catch{}acc.authed=false;renderAcc();closeAcc();openAcc()}
 
 /* polling — pauses when tab hidden to stay light on resources */
@@ -658,7 +659,7 @@ function startPoll(){if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval
 },5000)}
 
 /* init */
-(async()=>{await Promise.allSettled([fetchChannels(),loadAcc(),fetchSlots()]);startPoll()})();
+(async()=>{try{hardened=!!(await api('/api/version')).hardened}catch{}$('guestBtn').hidden=hardened;await Promise.allSettled([fetchChannels(),loadAcc(),fetchSlots()]);startPoll()})();
 </script>
 </body>
 </html>

@@ -1,0 +1,14 @@
+*
+!Dockerfile
+!Dockerfile.egress
+!requirements.txt
+!requirements.lock
+!main.py
+!bigo.py
+!bigo_recorder.py
+!network_policy.py
+!index.html
+!egress-domains.txt
+!squid.conf
+!Dockerfile.ingress
+!ingress.py
