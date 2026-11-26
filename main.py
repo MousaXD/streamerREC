@@ -31,7 +31,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from network_policy import approved_url
 from recording_library import build_library, probe_duration, media_duration, MEDIA_SUFFIXES, FINISHED
 from live_features import (PLATFORMS, SAMPLE_INTERVAL, SAMPLE_MAX_AGE, platform_key, channel_url,
-    viewer_count, add_viewer_sample, viewer_summary, clip_samples, scoped_cookie_text, parse_netscape_cookies)
+    viewer_count, add_viewer_sample, viewer_summary, clip_samples, scoped_cookie_text, parse_netscape_cookies, live_probe_status)
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -74,7 +74,7 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 _static_dir = os.environ.get("STATIC_DIR", str(Path(__file__).parent))
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 START_TIME = time.time()
 
 # ── Login rate limiting ───────────────────────────────────────────────────────
@@ -557,7 +557,7 @@ def _save_state_sync():
     saved_channels = {}
     for cid, ch in list(channels.items()):
         c = dict(ch)
-        for k in ("recording_id", "is_live", "last_checked", "viewer_count", "viewer_checked_at"):
+        for k in ("recording_id", "is_live", "last_checked", "viewer_count", "viewer_checked_at", "live_check_status", "live_check_message", "capture_engine", "engine_checked_at"):
             c.pop(k, None)
         # Strip sensitive credentials from disk-persisted state
         for k in ("ch_password",):
@@ -606,6 +606,10 @@ def _load_state():
             ch["last_checked"] = None
             ch.pop("viewer_count", None)
             ch.pop("viewer_checked_at", None)
+            ch.pop("live_check_status", None)
+            ch.pop("live_check_message", None)
+            ch.pop("capture_engine", None)
+            ch.pop("engine_checked_at", None)
             # Re-detect platform for any channels saved as Unknown
             if ch.get("platform") in ("Unknown", "", None) and ch.get("url"):
                 ch["platform"] = detect_platform(ch["url"])
@@ -715,6 +719,67 @@ def _username_from_url(url: str) -> str:
     return ""
 
 
+def _streamlink_options(proxy: str, cookie_path: str = "") -> list[str]:
+    args = ["streamlink", "--no-config", "--no-plugin-sideloading", "--no-plugin-cache",
+            "--http-timeout", "12", "--stream-timeout", "30", "--retry-open", "1", "--retry-streams", "0", "--retry-max", "0"]
+    if proxy := _effective_proxy(proxy):
+        args += ["--http-proxy", proxy, "--https-proxy", proxy]
+    if cookie_path:
+        args += ["--http-cookies-file", cookie_path]
+    return args
+
+
+def _streamlink_quality(quality: str) -> str:
+    # TikTok's FLV stream names are codec/quality tiers, not exact pixel sizes.
+    # Prefer H.264 video (not the audio-only rendition) for browser playback.
+    choices = {
+        "1080p": "h264_origin,h264_hd,h264_sd,h264_ld,best",
+        "720p": "h264_hd,h264_sd,h264_ld,h264_origin,best",
+        "480p": "h264_sd,h264_ld,h264_hd,h264_origin,best",
+    }
+    return choices.get(quality, "h264_origin,h264_uhd,h264_hd,h264_sd,h264_ld,best")
+
+
+async def _probe_tiktok_streamlink(url: str, proxy: str, cookie_path: str = "") -> dict | None:
+    if platform_key(url) != "tiktok":
+        return None
+    proc = None
+    try:
+        async with _proc_semaphore:
+            proc = await asyncio.create_subprocess_exec(
+                *_streamlink_options(proxy, cookie_path), "--json", "--", url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                **_subprocess_kwargs())
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+        if proc.returncode != 0:
+            return None
+        data = json.loads(stdout)
+        if not isinstance(data, dict) or data.get("plugin") != "tiktok":
+            return None
+        streams = data.get("streams")
+        if not isinstance(streams, dict) or not streams:
+            return None
+        # A resolved audio-only stream isn't proof that video can be recorded.
+        if not any(name not in ("best", "worst") and not name.endswith("_ao") and isinstance(value, dict)
+                   for name, value in streams.items()):
+            return None
+        meta = data.get("metadata") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        return {"is_live": True, "viewer_count": None, "observed_at": time.time(),
+                "live_check_status": "live", "live_check_message": None, "capture_engine": "streamlink",
+                "stream_title": str(meta.get("title") or "")[:500]}
+    except (OSError, ValueError, TypeError, asyncio.TimeoutError):
+        return None
+    finally:
+        if proc is not None and proc.returncode is None:
+            _kill_proc(proc.pid, force=True)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, OSError):
+                pass
+
+
 async def fetch_metadata(url: str, proxy: str = "", cookies_file: str = "") -> dict:
     with _cookie_snapshot(url, cookies_file) as cookie_path:
         return await _fetch_metadata(url, proxy, cookie_path)
@@ -758,10 +823,10 @@ async def _fetch_metadata(url: str, proxy: str, cookie_path: str) -> dict:
                 "--playlist-items", "1", "--socket-timeout", "15",
                 *_yt_dlp_options(proxy, cookie_path), "--", url,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 **_subprocess_kwargs(),
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
 
         # Even if yt-dlp returns non-zero (offline room), stdout may still have data
         if stdout:
@@ -774,6 +839,12 @@ async def _fetch_metadata(url: str, proxy: str, cookie_path: str) -> dict:
 
         if not isinstance(data, dict):
             data = {}
+        check_status, check_message = live_probe_status(url, data, proc.returncode, stderr)
+        if check_status == "unknown" and platform_key(url) == "tiktok":
+            fallback = await _probe_tiktok_streamlink(url, proxy, cookie_path)
+            if fallback:
+                return {**fallback, "display_name": url_username, "username": url_username,
+                        "avatar": "", "thumbnail": "", "_lookup_error": False}
         thumbnails = data.get("thumbnails") or []
         thumbnail  = data.get("thumbnail") or (thumbnails[-1]["url"] if thumbnails else "")
         avatar = ""
@@ -797,7 +868,11 @@ async def _fetch_metadata(url: str, proxy: str, cookie_path: str) -> dict:
             "username":     username,
             "avatar":       avatar,
             "thumbnail":    thumbnail,
-            "is_live":      data.get("is_live") is True or data.get("live_status") == "is_live",
+            "is_live":      check_status == "live",
+            "live_check_status": check_status,
+            "live_check_message": check_message,
+            "capture_engine": "yt-dlp" if check_status == "live" else None,
+            "_lookup_error": check_status == "unknown",
             "viewer_count": viewer_count(data.get("concurrent_view_count")),
             "stream_title": (data.get("title") or "").strip(),
         }
@@ -810,6 +885,9 @@ async def _fetch_metadata(url: str, proxy: str, cookie_path: str) -> dict:
                 "avatar":       "",
                 "thumbnail":    "",
                 "is_live":      False,
+                "_lookup_error": True,
+                "live_check_status": "unknown",
+                "live_check_message": "Metadata check could not complete. Automatic checks will continue.",
                 "stream_title": "",
             }
         return {}
@@ -889,8 +967,8 @@ async def check_is_live(url: str, proxy: str = "", cookies_file: str = "") -> bo
     return (await probe_live(url, proxy, cookies_file))["is_live"]
 
 
-async def probe_live(url: str, proxy: str = "", cookies_file: str = "") -> dict:
-    """One metadata request: only a concurrent live count is accepted."""
+async def probe_live(url: str, proxy: str = "", cookies_file: str = "", *, allow_fallback: bool = True) -> dict:
+    """Use normal supported extractors; distinguish unknown from offline."""
     proxy = _effective_proxy(proxy)
     with _cookie_snapshot(url, cookies_file) as cookie_path:
         if is_bigo_url(url):
@@ -901,30 +979,51 @@ async def probe_live(url: str, proxy: str = "", cookies_file: str = "") -> dict:
             result = await _check_chaturbate_live(url, proxy=proxy)
             if result is not None:
                 return {"is_live": result, "viewer_count": None, "observed_at": time.time()}
-        cmd = ["yt-dlp", "--dump-single-json", "--skip-download", "--no-warnings",
+        cmd = ["yt-dlp", "--dump-single-json", "--skip-download",
                "--socket-timeout", "20", "--playlist-items", "1",
                *_yt_dlp_options(proxy, cookie_path), "--", url]
         proc = None
+        data = None
+        status, message = "unknown", "Live check could not complete. Automatic checks will continue."
         try:
             async with _proc_semaphore:
                 proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.DEVNULL, **_subprocess_kwargs())
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=35)
-            data = json.loads(stdout) if proc.returncode == 0 else None
-            live = isinstance(data, dict) and (data.get("is_live") is True or data.get("live_status") == "is_live")
-            return {"is_live": live, "viewer_count": viewer_count(data.get("concurrent_view_count")) if live else None, "observed_at": time.time()}
+                            stderr=asyncio.subprocess.PIPE, **_subprocess_kwargs())
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=35)
+            try:
+                data = json.loads(stdout) if stdout and proc.returncode == 0 else None
+            except (ValueError, TypeError):
+                data = None
+            status, message = live_probe_status(url, data, proc.returncode, stderr)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.debug("Live probe failed: %s", type(exc).__name__)
-            return {"is_live": False, "viewer_count": None, "observed_at": time.time()}
         finally:
-            if proc and proc.returncode is None:
+            if proc is not None and proc.returncode is None:
                 _kill_proc(proc.pid, force=True)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2)
                 except (asyncio.TimeoutError, OSError):
                     pass
+        if status == "unknown" and allow_fallback and platform_key(url) == "tiktok":
+            fallback = await _probe_tiktok_streamlink(url, proxy, cookie_path)
+            if fallback:
+                return fallback
+        live = status == "live"
+        return {"is_live": live, "viewer_count": viewer_count(data.get("concurrent_view_count")) if live else None,
+                "observed_at": time.time(), "live_check_status": status, "live_check_message": message,
+                "capture_engine": "yt-dlp" if live else None}
+
+
+def _remember_capture_engine(ch: dict, info: dict):
+    engine = info.get("capture_engine")
+    if info.get("is_live") and engine in ("yt-dlp", "streamlink"):
+        ch["capture_engine"] = engine
+        ch["engine_checked_at"] = time.time()
+    else:
+        ch.pop("capture_engine", None)
+        ch.pop("engine_checked_at", None)
 
 
 def _set_channel_viewers(ch: dict, count, observed_at: float):
@@ -941,7 +1040,7 @@ async def _sample_recording_viewers(ch_id: str, rec_id: str):
     try:
         if HARDENED:
             approved_url(ch["url"])
-        info = await probe_live(ch["url"], proxy=ch.get("proxy") or settings.get("proxy", ""), cookies_file=ch.get("cookies_file", ""))
+        info = await probe_live(ch["url"], proxy=ch.get("proxy") or settings.get("proxy", ""), cookies_file=ch.get("cookies_file", ""), allow_fallback=False)
         # Never attribute an old request to a replacement recording, nor count
         # samples collected after the actual recording has ended.
         if channels.get(ch_id) is not ch or ch.get("recording_id") != rec_id or rec.get("status") != "recording":
@@ -1032,6 +1131,35 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
     platform     = platform_raw.lower()
 
     source_url = url
+    capture_engine = "yt-dlp"
+    if platform_key(url) == "tiktok":
+        if ch.get("capture_engine") in ("yt-dlp", "streamlink") and time.time() - (ch.get("engine_checked_at") or 0) <= 75:
+            capture_engine = ch["capture_engine"]
+        else:
+            result = await probe_live(url, proxy=ch.get("proxy") or settings.get("proxy", ""), cookies_file=ch.get("cookies_file", ""))
+            _remember_capture_engine(ch, result)
+            if rec.get("stopping") or channels.get(rec["channel_id"]) is not ch or ch.get("recording_id") != rec_id:
+                rec["status"] = "completed"
+                rec["ended_at"] = time.time()
+                if ch.get("recording_id") == rec_id:
+                    ch["recording_id"] = None
+                _save_state()
+                return
+            if not result.get("is_live"):
+                rec["status"] = "error"
+                rec["ended_at"] = time.time()
+                rec["live_check_status"] = result.get("live_check_status", "unknown")
+                rec["error"] = result.get("live_check_message") or "No playable live stream found"
+                rec["log"] = ["[StreamRec] " + rec["error"]]
+                ch["recording_id"] = None
+                ch["live_check_status"] = rec["live_check_status"]
+                ch["live_check_message"] = result.get("live_check_message")
+                ch["last_checked"] = time.time()
+                _set_channel_viewers(ch, None, time.time())
+                _save_state()
+                return
+            capture_engine = result.get("capture_engine") or "yt-dlp"
+    rec["capture_engine"] = capture_engine
     if platform == "bigo":
         bigo_proxy = _effective_proxy(ch.get("proxy") or settings.get("proxy", ""))
         try:
@@ -1066,7 +1194,7 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
     time_str     = now.strftime("%H-%M-%S")
     rec_dir      = RECORDINGS_DIR / safe_plat / safe_user / date_str
     rec_dir.mkdir(parents=True, exist_ok=True)
-    stem         = f"{safe_user}_{date_str}_{time_str}"
+    stem         = f"{safe_user}_{date_str}_{time_str}" + (f"_{rec_id}" if capture_engine == "streamlink" else "")
     output_path  = rec_dir / f"{stem}.%(ext)s"
 
     _no_live_from_start = (
@@ -1196,12 +1324,18 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
             cmd += ["--proxy", proxy]
         if cookie_path:
             cmd += ["--cookies-file", cookie_path]
+    elif capture_engine == "streamlink":
+        capture_path = rec_dir / f"{stem}.flv"
+        if capture_path.exists():
+            raise FileExistsError("Capture destination already exists")
+        cmd = [*_streamlink_options(proxy, cookie_path), "--output", str(capture_path),
+               "--", source_url, _streamlink_quality(quality)]
     else:
         cmd += ["-o", str(output_path), "--", source_url]
 
     rec["status"]     = "recording"
     rec["started_at"] = time.time()
-    rec["log"]        = []
+    rec["log"]        = ["[StreamRec] Using Streamlink TikTok fallback; selecting a browser-compatible video rendition when available."] if capture_engine == "streamlink" else []
     size_task         = None
     proc              = None
     duration_task     = None
@@ -1354,6 +1488,12 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
             rec["status"] = "completed" if (rc == 0 or rec.get("stopping") or file_captured) else "error"
         if rc != 0 and not rec.get("stopping") and rec["status"] == "error":
             rec["error"] = f"Exit code {rc}"
+            if not file_captured and platform_key(url) == "tiktok":
+                status, message = live_probe_status(url, None, rc, "\n".join(rec.get("log", [])[-15:]))
+                rec["live_check_status"] = status
+                rec["error"] = message or rec["error"]
+                if message:
+                    rec["log"].append("[StreamRec] " + message)
             logger.warning("Recording %s failed with exit code %d", rec_id, rc)
         else:
             logger.info("Recording %s completed", rec_id)
@@ -1403,21 +1543,21 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
             except Exception:
                 pass
 
-        # Native BIGO capture is written as MPEG-TS so protected HLS segments
-        # can be decoded safely. Remux to the requested container afterward.
+        # Native BIGO and Streamlink capture to transport/FLV containers.
+        # Remux locally to the requested container, retaining the original on failure.
         fp = rec.get("filepath", "")
         target_fmt = fmt.lower() if fmt.lower() in ("mp4", "mkv", "ts") else "ts"
         if (
-            platform == "bigo"
+            (platform == "bigo" or capture_engine == "streamlink")
             and rec.get("status") == "completed"
             and fp
             and Path(fp).exists()
-            and target_fmt != "ts"
+            and Path(fp).suffix.lower() != "." + target_fmt
         ):
             target_path = str(Path(fp).with_suffix(f".{target_fmt}"))
             try:
                 async with _proc_semaphore:
-                    remux_cmd = ["ffmpeg", "-i", fp, "-c", "copy"]
+                    remux_cmd = ["ffmpeg", "-protocol_whitelist", "file", "-i", fp, "-c", "copy"]
                     if target_fmt == "mp4":
                         remux_cmd += ["-movflags", "+faststart"]
                     remux_cmd += ["-threads", ffmpeg_threads, target_path, "-y"]
@@ -1444,7 +1584,7 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
         # smooth playback (faststart).  Run on ALL completed recordings —
         # not just manual stops — so files play without lag on any device.
         fp = rec.get("filepath", "")
-        if platform != "bigo" and fp and Path(fp).exists():
+        if platform != "bigo" and capture_engine != "streamlink" and fp and Path(fp).exists():
             suffix    = Path(fp).suffix
             fixed_path = str(Path(fp).with_name(Path(fp).stem + "_fixed" + suffix))
             try:
@@ -1511,6 +1651,14 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
                 ch_entry["recording_id"] = None
                 ch_entry["is_live"]      = False
                 ch_entry["viewer_count"] = None
+                ch_entry.pop("capture_engine", None)
+                ch_entry.pop("engine_checked_at", None)
+                if rec.get("live_check_status") == "unknown":
+                    ch_entry["live_check_status"] = "unknown"
+                    ch_entry["live_check_message"] = rec.get("error")
+                else:
+                    ch_entry.pop("live_check_status", None)
+                    ch_entry.pop("live_check_message", None)
 
         _save_state()
 
@@ -1548,6 +1696,7 @@ async def _run_recording(rec_id: str, cookie_path: str = ""):
             not rec.get("stopping")
             and not natural_end
             and rec.get("status") == "error"
+            and rec.get("live_check_status") != "unknown"
             and not any("not currently live" in line.lower() or "not live" in line.lower() for line in rec.get("log", [])[-15:])
             and settings.get("auto_retry", True)
             and retry_ch_id
@@ -1727,14 +1876,26 @@ async def _check_one_channel(ch_id: str) -> None:
         info = await probe_live(ch["url"], proxy=proxy, cookies_file=ch.get("cookies_file", ""))
         is_live = info["is_live"]
     except Exception as e:
-        logger.warning("Live check failed for %s (%s): %s", ch_id, ch.get("url"), e)
+        logger.warning("Live check failed for %s: %s", ch_id, type(e).__name__)
+        if channels.get(ch_id) is ch and not ch.get("recording_id"):
+            ch["live_check_status"] = "unknown"
+            ch["live_check_message"] = "Live check could not complete. Automatic checks will continue."
+            ch["last_checked"] = time.time()
+            _set_channel_viewers(ch, None, time.time())
         return
 
     # Channel could have been deleted while we were awaiting
-    if ch_id not in channels:
+    if channels.get(ch_id) is not ch or ch.get("recording_id"):
         return
-    channels[ch_id]["is_live"]      = is_live
-    channels[ch_id]["last_checked"] = time.time()
+    check_status = info.get("live_check_status", "live" if is_live else "offline")
+    ch["live_check_status"] = check_status
+    ch["live_check_message"] = info.get("live_check_message")
+    _remember_capture_engine(ch, info)
+    if info.get("stream_title"):
+        ch["stream_title"] = info["stream_title"]
+    if check_status != "unknown":
+        ch["is_live"] = is_live
+    ch["last_checked"] = time.time()
     _set_channel_viewers(channels[ch_id], info["viewer_count"], info["observed_at"])
     if is_live and not channels[ch_id].get("recording_id"):
         logger.info("Channel %s is live — starting auto-record", ch_id)
@@ -1938,10 +2099,13 @@ async def add_channel(req: AddChannelRequest):
                 "thumbnail":    meta.get("thumbnail", ""),
                 "stream_title": meta.get("stream_title", ""),
                 "is_live":      meta.get("is_live", False),
+                "live_check_status": meta.get("live_check_status", "unknown" if meta.get("_lookup_error") else "live" if meta.get("is_live") else "offline"),
+                "live_check_message": meta.get("live_check_message"),
                 "viewer_count": meta.get("viewer_count"),
                 "viewer_checked_at": time.time(),
                 "last_checked": time.time(),
             })
+            _remember_capture_engine(channels[ch_id], meta)
             _save_state()
             if meta.get("is_live") and channels[ch_id].get("monitoring", True) and not channels[ch_id].get("recording_id"):
                 rid = await _start_recording_for_channel(ch_id)
@@ -1968,6 +2132,7 @@ async def list_channels():
         if rec_id and rec_id in recordings:
             r = recordings[rec_id]
             c["rec_status"]  = r["status"]
+            c["rec_engine"] = r.get("capture_engine")
             c["rec_bytes"]   = r.get("bytes", 0)
             c["rec_speed"]   = r.get("speed")
             c["rec_started"] = r.get("started_at")
@@ -2080,12 +2245,25 @@ async def refresh_channel(ch_id: str):
             "thumbnail":    meta.get("thumbnail")    or ch.get("thumbnail", ""),
             "stream_title": meta.get("stream_title") or ch.get("stream_title", ""),
         }
+        updates["live_check_status"] = meta.get("live_check_status", "unknown" if meta.get("_lookup_error") else "live" if meta.get("is_live") else "offline")
+        updates["live_check_message"] = meta.get("live_check_message") or ("Live check could not complete. Automatic checks will continue." if meta.get("_lookup_error") else None)
+        updates["last_checked"] = time.time()
         if not meta.get("_lookup_error"):
             updates["is_live"] = meta.get("is_live", False)
-            updates["last_checked"] = time.time()
             updates["viewer_count"] = meta.get("viewer_count")
             updates["viewer_checked_at"] = time.time()
+        if channels.get(ch_id) is not ch:
+            raise HTTPException(404, "Not found")
+        if ch.get("recording_id"):
+            for key in ("is_live", "live_check_status", "live_check_message", "viewer_count", "viewer_checked_at"):
+                updates.pop(key, None)
         channels[ch_id].update(updates)
+        if not ch.get("recording_id"):
+            _remember_capture_engine(ch, meta)
+            if meta.get("is_live") and (ch.get("monitoring", True) or settings.get("record_on_add", False)):
+                rid = await _start_recording_for_channel(ch_id)
+                if rid and rid in recordings:
+                    recordings[rid]["auto"] = True
     _save_state()
     return channels[ch_id]
 
@@ -2867,7 +3045,7 @@ async def export_config():
     saved_channels = {}
     for cid, ch in channels.items():
         c = dict(ch)
-        for k in ("recording_id", "is_live", "last_checked", "viewer_count", "viewer_checked_at"):
+        for k in ("recording_id", "is_live", "last_checked", "viewer_count", "viewer_checked_at", "live_check_status", "live_check_message", "capture_engine", "engine_checked_at"):
             c.pop(k, None)
         c.pop("ch_password", None)  # never export credentials
         saved_channels[cid] = c

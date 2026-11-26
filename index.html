@@ -495,9 +495,10 @@ function platEmoji(p){p=(p||'').toLowerCase();return p.includes('twitch')?'🟣'
 function card(ch){
   const isRec=ch.rec_status==='recording'||ch.rec_status==='starting';
   const mon=ch.monitoring!==false;
+  const unknown=ch.live_check_status==='unknown',confirmedLive=ch.is_live&&!unknown;
   const name=ch.display_name||ch.platform||'Streamer';
   const ini=(name[0]||'?').toUpperCase();
-  return `<div class="card ${isRec?'rec':ch.is_live?'live':''}">
+  return `<div class="card ${isRec?'rec':confirmedLive?'live':''}">
   <div class="card-top">
     <div class="av">
       ${ch.avatar?`<img src="${esc(ch.avatar)}" onerror="this.style.display='none';this.nextElementSibling.style.display='grid'" alt="">`:''}
@@ -505,17 +506,19 @@ function card(ch){
       <div class="plat">${platEmoji(ch.platform)}</div>
     </div>
     <div class="cinfo"><div class="cname">${esc(name)}</div><div class="csub">${esc(ch.platform||'')} · ${ago(ch.last_checked)} ago</div></div>
-    <span class="badge ${isRec?'rec':ch.is_live?'live':'off'}">${isRec?'REC':ch.is_live?'LIVE':mon?'WATCH':'OFF'}</span>
+    <span class="badge ${isRec?'rec':confirmedLive?'live':'off'}" style="${!isRec&&unknown?'color:var(--warn)':''}">${isRec?(ch.rec_bytes>0?'REC':'STARTING'):unknown?'UNVERIFIED':confirmedLive?'LIVE':mon?'WATCH':'OFF'}</span>
   </div>
   ${ch.stream_title?`<div class="stitle" title="${esc(ch.stream_title)}">${esc(ch.stream_title)}</div>`:''}
-  ${(ch.is_live||isRec)?`<div class="live-metrics"><span class="viewer-chip">${ch.viewer_count==null?'—':fmtViews(ch.viewer_count)} <small>${ch.viewer_count==null?'viewers unavailable':'watching now'}</small></span>${ch.viewer_peak!=null?`<span class="viewer-peak">Peak ${fmtViews(ch.viewer_peak)}</span>`:''}</div>`:''}
-  ${isRec?`<div class="metrics"><span class="metric">⏱ ${fmtDur(ch.rec_started)}</span><span class="metric">⚡ ${esc(ch.rec_speed||'—')}</span><span class="metric">💾 ${fmtB(ch.rec_bytes)}</span></div>`:''}
+  ${!isRec&&unknown?`<div class="error-note" style="padding:6px 0">${esc(ch.live_check_message||'Live status could not be verified.')}</div>`:''}
+  ${(confirmedLive||isRec)?`<div class="live-metrics"><span class="viewer-chip">${ch.viewer_count==null?'—':fmtViews(ch.viewer_count)} <small>${ch.viewer_count==null?'viewers unavailable':'watching now'}</small></span>${ch.viewer_peak!=null?`<span class="viewer-peak">Peak ${fmtViews(ch.viewer_peak)}</span>`:''}</div>`:''}
+  ${isRec?`<div class="metrics">${ch.rec_engine==='streamlink'?'<span class="metric">Streamlink fallback</span>':''}<span class="metric">⏱ ${fmtDur(ch.rec_started)}</span><span class="metric">⚡ ${esc(ch.rec_speed||'—')}</span><span class="metric">💾 ${fmtB(ch.rec_bytes)}</span></div>`:''}
   <div class="cact">
     <div class="cact-l"><div class="sw ${mon?'on':''}" onclick="tglMon('${ch.id}')"></div>${mon?'Active':'Paused'}</div>
     <div class="cact-r">
       ${isRec
         ?`<button class="ibtn rec-on" title="Stop" onclick="stopCh('${ch.id}')"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>`
         :`<button class="ibtn" title="Record now" style="color:var(--acc)" onclick="recCh('${ch.id}')"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="7"/></svg></button>`}
+      ${!isRec?`<button class="ibtn" title="Check live status now" onclick="checkChannel('${ch.id}',this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 7v5h-5M4 17v-5h5M5.6 8a7 7 0 0 1 11.5-2L20 9M4 15l2.9 3A7 7 0 0 0 18.4 16"/></svg></button>`:''}
       ${ch.rec_id?`<button class="ibtn" title="Viewer analytics" onclick="openPlayer('${ch.rec_id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18M6 15l5-5 4 3 5-7"/></svg></button>`:''}
       <button class="ibtn" title="Logs" onclick="openLog('${ch.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 10h16M4 14h16M4 18h10"/></svg></button>
       <button class="ibtn" title="Settings" onclick="openCh('${ch.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15A7.8 7.8 0 0020 12a7.8 7.8 0 00-.1-1.2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 00-2-1.2L15 3h-4l-.4 2.6a7.6 7.6 0 00-2 1.2l-2.4-1-2 3.4 2 1.6A7.8 7.8 0 006 12c0 .4 0 .8.1 1.2l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 002 1.2L11 21h4l.4-2.6a7.6 7.6 0 002-1.2l2.4 1 2-3.4z"/></svg></button>
@@ -531,7 +534,7 @@ function renderChannels(){
   });
   const cmp={name:(a,b)=>(a.display_name||'').localeCompare(b.display_name||''),platform:(a,b)=>(a.platform||'').localeCompare(b.platform||''),recent:(a,b)=>b.created_at-a.created_at,live:(a,b)=>((b.is_live||0)-(a.is_live||0))||b.created_at-a.created_at,viewers:(a,b)=>(b.viewer_count??-1)-(a.viewer_count??-1),custom:(a,b)=>(a.sort_order??9999)-(b.sort_order??9999)};
   list.sort(cmp[s]||cmp.custom);
-  const live=list.some(c=>c.is_live||c.rec_status==='recording');
+  const live=list.some(c=>(c.is_live&&c.live_check_status!=='unknown')||(c.rec_status==='recording'&&c.rec_bytes>0));
   $('liveDot').classList.toggle('on',live);
   $('grid').innerHTML=list.length?list.map(card).join(''):
     `<div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg><b>No channels</b><span>Click "Add Channel" to start monitoring streams.</span></div>`;
@@ -539,7 +542,9 @@ function renderChannels(){
 async function fetchChannels(){try{const l=await api('/api/channels');channels={};l.forEach(c=>channels[c.id]=c);renderChannels()}catch{}}
 async function fetchSlots(){try{const d=await api('/api/health');$('slots').textContent=`${d.active}/${d.pi_mode?3:6}`} catch{}}
 
-async function recCh(id){try{await api(`/api/channels/${id}/record`,{method:'POST'});toast('Recording started');fetchChannels()}catch(e){toast(e.message||'Failed',true)}}
+const checkingChannels=new Set();
+async function checkChannel(id,btn){if(checkingChannels.has(id))return;checkingChannels.add(id);btn.disabled=true;try{const d=await api(`/api/channels/${id}/refresh`,{method:'POST'});toast(d.live_check_status==='unknown'?'Live status unverified; monitoring will continue.':d.is_live?'Live stream found':'No live stream detected');await fetchChannels()}catch(e){toast(e.message,true)}finally{checkingChannels.delete(id);btn.disabled=false}}
+async function recCh(id){try{await api(`/api/channels/${id}/record`,{method:'POST'});toast('Recording requested; waiting for stream data');fetchChannels()}catch(e){toast(e.message||'Failed',true)}}
 async function stopCh(id){try{await api(`/api/channels/${id}/stop`,{method:'POST'});toast('Stopping…');fetchChannels()}catch(e){toast(e.message,true)}}
 async function tglMon(id){const c=channels[id];if(!c)return;try{await api(`/api/channels/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({monitoring:c.monitoring===false})});fetchChannels()}catch{}}
 async function delCh(){const id=$('chId').value;if(!confirm('Remove this channel?'))return;try{await api(`/api/channels/${id}`,{method:'DELETE'});delete channels[id];renderChannels();closeCh();toast('Removed')}catch(e){toast(e.message,true)}}

@@ -156,3 +156,29 @@ def parse_netscape_cookies(text: str) -> list[dict]:
                         'secure': secure.upper() == 'TRUE', 'expirationDate': expiry,
                         'name': name, 'value': value, 'httpOnly': http_only})
     return cookies
+
+
+def live_probe_status(url: str, data, returncode: int, stderr: bytes | str = '') -> tuple[str, str | None]:
+    """Do not infer offline from failed extraction or missing metadata.
+
+    TikTokLiveIE uses UserNotLive for both a missing room ID (including a
+    challenge page) and a confirmed offline room. Its exit text alone cannot
+    distinguish these cases. Only actual successful metadata can confirm state.
+    Error messages are fixed strings: never expose raw network responses or URLs.
+    """
+    if returncode == 0 and isinstance(data, dict):
+        if data.get('is_live') is True or data.get('live_status') == 'is_live':
+            return 'live', None
+        if data.get('is_live') is False or data.get('live_status') in ('not_live', 'was_live', 'post_live', 'is_upcoming'):
+            return 'offline', None
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode('utf-8', errors='replace')
+    message = (stderr or '').lower()
+    if platform_key(url) == 'tiktok':
+        if 'not currently live' in message or 'not live' in message:
+            return 'unknown', 'TikTok did not provide usable live-room information. The stream may be live or offline. Automatic checks will continue.'
+        if any(x in message for x in ('captcha', 'challenge', 'verification', 'access denied', 'http error 403', 'http error 429', 'login', 'sign in')):
+            return 'unknown', 'TikTok declined the automated live check. Open the official live page to verify availability.'
+    elif 'not currently live' in message or 'not live' in message or 'livestream has ended' in message:
+        return 'offline', None
+    return 'unknown', 'The recording engine could not verify live status. Automatic checks will continue.'

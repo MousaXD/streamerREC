@@ -2,5 +2,6 @@ fastapi==0.165.0
 pycryptodome==3.24.1
 pydantic==2.14.4
 python-multipart==0.0.34
-streamlink==8.5.0
+streamlink==8.6.3
 uvicorn[standard]==0.54.0
+curl-cffi==0.17.0
