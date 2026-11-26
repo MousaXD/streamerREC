@@ -49,6 +49,10 @@ class BigoLoginRequired(BigoError):
     """BIGO withheld the room data pending an authenticated session."""
 
 
+class BigoTransportError(BigoError):
+    """A transient network or TLS failure while contacting BIGO."""
+
+
 def decrypt_web_protection_prefix(packets: bytearray, seed: int) -> None:
     """Decrypt BIGO's protected bytes in the first two MPEG-TS packets in-place.
 
@@ -226,11 +230,13 @@ def _run_curl(cmd: list[str]) -> str:
     except FileNotFoundError as exc:
         raise BigoError("curl is required for native BIGO support") from exc
     except subprocess.TimeoutExpired as exc:
-        raise BigoError("BIGO request timed out") from exc
+        raise BigoTransportError("BIGO request timed out") from exc
 
     if result.returncode != 0:
         detail = (result.stderr or "").strip().splitlines()
         message = detail[-1] if detail else f"curl exited with {result.returncode}"
+        if result.returncode in (5, 6, 7, 18, 28, 35, 52, 55, 56):
+            raise BigoTransportError(f"BIGO connection failed (curl {result.returncode})")
         raise BigoError(f"BIGO request failed: {message}")
     return result.stdout
 
@@ -445,7 +451,6 @@ def _resolve_site_id_sync(url: str, proxy: str = "") -> str:
 
 def _fetch_bigo_info_sync(url: str, proxy: str = "") -> BigoInfo:
     site_id = _resolve_site_id_sync(url, proxy=proxy)
-    payload = _fetch_studio_payload(site_id, proxy=proxy)
 
     def parse_room(result):
         data = result.get("data")
@@ -461,20 +466,33 @@ def _fetch_bigo_info_sync(url: str, proxy: str = "") -> BigoInfo:
         source = source.strip()
         return data, alive, str(data.get("roomId") or ""), source
 
-    data, alive, room_id, hls_src = parse_room(payload)
-
     def needs_login(data):
         return data.get("needLogin") in (True, 1, "1", "true")
 
-    # BIGO's normal public web request includes a one-use integrity token.
-    # The legacy request without it may report alive=0, roomId=0, needLogin
-    # and an empty HLS URL even while a public broadcast is actually live.
-    # Resolve that placeholder through the normal tokenized request once.
-    # If the tokenized response still requires login, honor that requirement.
-    if not hls_src and (alive or needs_login(data)):
-        token = _mint_bigo_token_sync(proxy=proxy)
-        payload = _fetch_studio_payload(site_id, proxy=proxy, token=token)
-        data, alive, room_id, hls_src = parse_room(payload)
+    def tokenized_room():
+        # Retry a transient failure only once. Never replay a possibly spent
+        # token: a retry starts with a fresh public-web token request.
+        for attempt in range(2):
+            try:
+                token = _mint_bigo_token_sync(proxy=proxy)
+                return parse_room(_fetch_studio_payload(site_id, proxy=proxy, token=token))
+            except BigoTransportError:
+                if attempt:
+                    raise
+
+    try:
+        data, alive, room_id, hls_src = parse_room(_fetch_studio_payload(site_id, proxy=proxy))
+    except BigoTransportError:
+        # The legacy probe is optional. If its connection fails, try the
+        # normal public web request instead of abandoning the live lookup.
+        data, alive, room_id, hls_src = tokenized_room()
+    else:
+        # BIGO's normal public web request includes a one-use integrity token.
+        # The legacy request without it may report alive=0, roomId=0,
+        # needLogin and an empty HLS URL even while a public broadcast is live.
+        # If the normal tokenized response still requires login, honor that.
+        if not hls_src and (alive or needs_login(data)):
+            data, alive, room_id, hls_src = tokenized_room()
 
     if not hls_src and needs_login(data):
         raise BigoLoginRequired("BIGO requires a signed-in session to verify this room. Connect your BIGO account in Settings.")

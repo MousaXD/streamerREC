@@ -6,6 +6,7 @@ from bigo import (
     BIGO_API,
     BigoError,
     BigoLoginRequired,
+    BigoTransportError,
     _curl_base,
     _evp_bytes_to_key,
     _fetch_bigo_info_sync,
@@ -136,6 +137,30 @@ class BigoTransportTests(unittest.TestCase):
                 fetch.return_value = {"code": 0, "data": data}
                 with self.assertRaises(BigoError):
                     _fetch_bigo_info_sync("https://www.bigo.tv/J8023")
+
+    @patch("bigo._resolve_site_id_sync", return_value="J8023")
+    @patch("bigo._mint_bigo_token_sync", side_effect=["first-token", "fresh-token"])
+    @patch("bigo._fetch_studio_payload")
+    def test_transient_tokenized_request_failure_mints_fresh_token(self, fetch, mint, _resolve):
+        fetch.side_effect = [
+            {"code": 0, "data": {"alive": 0, "needLogin": True, "hls_src": ""}},
+            BigoTransportError("connection failed"),
+            {"code": 0, "data": {"alive": 1, "roomId": "123", "hls_src": "https://cdn.invalid/live.m3u8"}},
+        ]
+        self.assertTrue(_fetch_bigo_info_sync("https://www.bigo.tv/J8023").alive)
+        self.assertEqual(mint.call_count, 2)
+        self.assertEqual(fetch.call_args_list[1].kwargs["token"], "first-token")
+        self.assertEqual(fetch.call_args_list[2].kwargs["token"], "fresh-token")
+
+    @patch("bigo._resolve_site_id_sync", return_value="J8023")
+    @patch("bigo._mint_bigo_token_sync", side_effect=[BigoTransportError("token connection failed"), "fresh-token"])
+    @patch("bigo._fetch_studio_payload")
+    def test_transport_failure_of_legacy_probe_and_token_mint_recovers(self, fetch, mint, _resolve):
+        fetch.side_effect = [BigoTransportError("legacy connection failed"),
+            {"code": 0, "data": {"alive": 1, "roomId": "123", "hls_src": "https://cdn.invalid/live.m3u8"}}]
+        self.assertTrue(_fetch_bigo_info_sync("https://www.bigo.tv/J8023").alive)
+        self.assertEqual(mint.call_count, 2)
+        self.assertEqual(fetch.call_args.kwargs["token"], "fresh-token")
 
     @patch("bigo._resolve_site_id_sync", return_value="J8023")
     @patch("bigo._mint_bigo_token_sync", return_value="token")

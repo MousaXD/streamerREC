@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from bigo import BigoError, BigoLoginRequired, fetch_bigo_info, is_bigo_url
+from bigo import BigoError, BigoLoginRequired, BigoTransportError, fetch_bigo_info, is_bigo_url
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -467,6 +467,8 @@ def _yt_dlp_options(proxy: str = "", cookie_path: str = "") -> list[str]:
 def _bigo_check_message(exc: Exception) -> str:
     if isinstance(exc, BigoLoginRequired):
         return "BIGO requires a signed-in session to verify this room. Connect your BIGO account in Settings → Platform Accounts."
+    if isinstance(exc, BigoTransportError):
+        return "BIGO network connection failed. Automatic checks will continue."
     return "BIGO could not verify a playable live stream. Automatic checks will continue."
 
 
